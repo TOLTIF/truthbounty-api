@@ -254,6 +254,25 @@ All failure modes throw exceptions — no silent fallback to fabricated or permi
 
 ---
 
+## Protected Operations (UX-BE-004, #595)
+
+Admin-plane routes under `/v1/operations`, guarded by `AdminGuard` + `RolesGuard`.
+Retry submission additionally requires an `Idempotency-Key`, a precondition
+token, and revalidated capability + expiry (fail closed).
+
+| Method | Path | Roles | Extra requirements |
+|---|---|---|---|
+| `GET` | `/v1/operations/queue` | super_admin, administrator, security_analyst, auditor | — |
+| `GET` | `/v1/operations/queue/:id` | super_admin, administrator, security_analyst, auditor | — |
+| `GET` | `/v1/operations/queue/:id/retry-eligibility` | super_admin, administrator, security_analyst, auditor | — |
+| `POST` | `/v1/operations/queue/:id/retry` | super_admin, administrator | `Idempotency-Key`, `X-Precondition-Token`, `X-Authority-Capability`, `X-Authority-Expires-At` |
+| `GET` | `/v1/operations/audit/:auditId` | super_admin, administrator, security_analyst, auditor | — |
+
+No operations route edits protocol state; the retry route re-enqueues existing
+work only. See [OPERATIONS_API.md](./OPERATIONS_API.md).
+
+---
+
 ## Non-Goals
 
 - Changing smart-contract protocol rules

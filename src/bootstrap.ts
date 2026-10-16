@@ -67,6 +67,10 @@ export function configureApp(app: INestApplication) {
     .addTag('support', 'Privacy-safe support intake and retention controls')
     .addTag('health', 'Health check endpoints')
     .addTag(
+      'Operations',
+      'Protected operational queue reads, safe-retry eligibility and submission, and audit-record lookup (UX-BE-004)',
+    )
+    .addTag(
       'ai-assistant',
       'AI assistant conversations, knowledge-base retrieval, and usage analytics',
     )
