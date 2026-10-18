@@ -60,6 +60,11 @@ const DEFAULT_BREAKER_OPTIONS: Partial<CircuitBreakerOptions> = {
   resetMs: 30_000,
 };
 
+/** Keep dependency labels bounded so status and metric series stay finite. */
+const MAX_DEPENDENCY_CIRCUITS = 32;
+const DEPENDENCY_NAME_PATTERN = /^[a-z][a-z0-9_-]{0,47}$/;
+const SENSITIVE_DEPENDENCY_NAME_PATTERN = /(secret|token|password|credential|api[-_]?key|private[-_]?key)/i;
+
 @Injectable()
 export class DependencyGuardService {
   private readonly logger = new Logger(DependencyGuardService.name);
@@ -78,6 +83,16 @@ export class DependencyGuardService {
    * Idempotent: re-registering an existing name resets it to CLOSED.
    */
   register(name: string, opts: Partial<CircuitBreakerOptions> = {}): void {
+    if (
+      !DEPENDENCY_NAME_PATTERN.test(name) ||
+      SENSITIVE_DEPENDENCY_NAME_PATTERN.test(name)
+    ) {
+      throw new Error('Dependency name must be a stable lowercase identifier');
+    }
+    if (!this.breakers.has(name) && this.breakers.size >= MAX_DEPENDENCY_CIRCUITS) {
+      throw new Error('Maximum registered dependency circuits reached');
+    }
+
     const threshold =
       this.configEnvNum(`CB_FAILURE_THRESHOLD_${name.toUpperCase()}`) ??
       opts.failureThreshold ??
@@ -96,6 +111,7 @@ export class DependencyGuardService {
       successThreshold:
         opts.successThreshold ?? DEFAULT_BREAKER_OPTIONS.successThreshold ?? 2,
       resetMs,
+      shouldCountFailure: opts.shouldCountFailure,
       onStateChange: (n, from, to) => {
         const level = to === 'OPEN' ? 'error' : 'warn';
         this.logger[level](

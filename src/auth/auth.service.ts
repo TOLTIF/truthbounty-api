@@ -13,14 +13,29 @@ import { RedisService } from '../redis/redis.service';
 import { SiweService } from './services/siwe.service';
 import { TokenService, TokenPair } from './services/token.service';
 import {
-  AUTH_GENERIC_FAILURE_MESSAGE,
+  AUTG_GENERIC_FAILURE_MESSAGE,
   constantTimeAddressEqual,
   timingSafeEqualUtf8,
 } from '../common/utils/timing-safe.util';
+import {
+  AuthenticatedPrincipal,
+} from './types/authenticated-request';
 
 interface ChallengeRecord {
   nonce: string;
   issuedAt: number; // Unix ms — app-layer TTL source of truth
+}
+
+interface LoginResponseUser {
+  id: string | null;
+  address: string;
+}
+
+interface LoginResponse {
+  accessToken: string;
+  refreshToken: string;
+  expiresIn: number;
+  user: LoginResponseUser;
 }
 
 @Injectable()
@@ -106,12 +121,7 @@ export class AuthService {
    * Verify wallet signature and issue JWT access + refresh tokens.
    * Supports both SIWE (EIP-4361) and legacy message formats.
    */
-  async login(loginDto: LoginDto): Promise<{
-    accessToken: string;
-    refreshToken: string;
-    expiresIn: number;
-    user: any;
-  }> {
+  async login(loginDto: LoginDto): Promise<LoginResponse> {
     const { address, signature, message } = loginDto;
     const normalizedAddress = address.toLowerCase();
     const key = `auth:nonce:${normalizedAddress}`;
@@ -166,7 +176,7 @@ export class AuthService {
       throw new UnauthorizedException(AUTH_GENERIC_FAILURE_MESSAGE);
     }
 
-    // App-layer TTL check: enforce expiry independently of Redis to prevent
+    // App-layer TTA check: enforce expiry independently of Redis to prevent
     // Redis-vs-app clock desync (BE-182). Redis TTL is the backstop;
     // this check is the authoritative gate.
     const elapsedSeconds = (Date.now() - record.issuedAt) / 1000;
@@ -222,21 +232,27 @@ export class AuthService {
   /**
    * Refresh an access token using a refresh token.
    */
-  async refresh(refreshToken: string): Promise<TokenPair & { user: any }> {
+  async refresh(refreshToken: string): Promise<TokenPair & { user: LoginResponseUser }> {
     const pair = await this.tokenService.refreshAccessToken(refreshToken);
 
     // Resolve user info for the response
-    const payload = this.jwtService.decode(pair.accessToken) as any;
-    const wallet = await this.prisma.wallet.findFirst({
-      where: { address: payload?.address },
-      include: { user: true },
-    });
+    const decoded = this.jwtService.decode(pair.accessToken);
+    const payload =
+      decoded && typeof decoded === 'object'
+        ? (decoded as { address?: string; userId?: string })
+        : {};
+    const wallet = payload.address
+      ? await this.prisma.wallet.findFirst({
+          where: { address: payload.address },
+          include: { user: true },
+        })
+      : null;
 
     return {
       ...pair,
       user: {
-        id: wallet?.user?.id || payload?.userId || null,
-        address: payload?.address,
+        id: wallet?.user?.id || payload.userId || null,
+        address: payload.address || '',
       },
     };
   }
@@ -244,7 +260,7 @@ export class AuthService {
   /**
    * Logout: invalidate the current session tokens.
    */
-  async logout(payload: any): Promise<void> {
+  async logout(payload: AuthenticatedPrincipal): Promise<void> {
     if (!payload || !payload.address) {
       throw new UnauthorizedException(AUTH_GENERIC_FAILURE_MESSAGE);
     }
@@ -259,9 +275,11 @@ export class AuthService {
   }
 
   /**
-   * Validate JWT token and return user info
+   * Validate JWT token and return the canonical authenticated principal.
+   * Returns null when the token is blacklisted or the principal cannot be
+   * resolved -- the caller (strategy) fails closed.
    */
-  async validateToken(payload: any): Promise<any> {
+  async validateToken(payload: JwtPayloadInput): Promise<AuthenticatedPrincipal | null> {
     const { address, userId } = payload;
 
     // If sub contains an address (0x...), prefer it for the wallet lookup
@@ -287,10 +305,21 @@ export class AuthService {
       }
     }
 
+    const resolvedAddress = wallet?.address || candidateAddress;
+    if (!resolvedAddress) {
+      // Fail closed: no principal address can be resolved.
+      return null;
+    }
+
     return {
-      address: wallet?.address || address,
-      userId: wallet?.user?.id || userId,
-      user: wallet?.user || null,
+      address: resolvedAddress,
+      userId: wallet?.user?.id || userId || null,
+      user: wallet?.user
+        ? {
+            id: wallet.user.id,
+            role: wallet.user.role,
+          }
+        : null,
       jti: payload.jti,
       sub: payload.sub,
     };
@@ -324,4 +353,15 @@ export class AuthService {
   private constantTimeEquals(a: string, b: string): boolean {
     return timingSafeEqualUtf8(a, b);
   }
+}
+
+/**
+ * Minimal shape of the verified JWT payload this service accepts.
+ * Kept explicit to avoid `any` at the validation boundary.
+ */
+export interface JwtPayloadInput {
+  address?: string;
+  userId?: string;
+  sub?: string;
+  jti?: string;
 }

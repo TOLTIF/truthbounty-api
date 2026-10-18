@@ -812,6 +812,28 @@ export const PINNED_OPENAPI_PATHS = {
     consumes: [],
     produces: ['application/json'],
   },
+
+  // PREWAVE-BE-005: versioned claim read models
+  'GET /api/v2/claim-read-models': {
+    versionAdded: '2.0.0',
+    versionDeprecated: null,
+    versionRemoved: null,
+    breakingChange: false,
+    summary: 'Versioned, cursor-paginated claim list read model',
+    authRequired: false,
+    consumes: [],
+    produces: ['application/json'],
+  },
+  'GET /api/v2/claim-read-models/:claimId': {
+    versionAdded: '2.0.0',
+    versionDeprecated: null,
+    versionRemoved: null,
+    breakingChange: false,
+    summary: 'Versioned canonical claim detail read model',
+    authRequired: false,
+    consumes: [],
+    produces: ['application/json'],
+  },
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -876,6 +898,43 @@ export const PINNED_OPENAPI_SCHEMAS = {
       createdAt: 'date-time',
       resolvedAt: 'date-time',
     },
+  },
+  // PREWAVE-BE-005: versioned claim read models
+  'ClaimReadModelList': {
+    versionAdded: '2.0.0',
+    requiredFields: [
+      'readModel',
+      'readModelVersion',
+      'observedAt',
+      'provenance',
+      'freshness',
+      'pagination',
+      'data',
+    ],
+    optionalFields: [],
+    enumFields: {},
+    formatFields: {},
+  },
+  'ClaimReadModelItem': {
+    versionAdded: '2.0.0',
+    requiredFields: [
+      'claimId',
+      'chainId',
+      'state',
+      'dataState',
+      'phase',
+      'lastEvent',
+      'deadlines',
+      'evidence',
+      'outcome',
+      'release',
+    ],
+    optionalFields: [],
+    enumFields: {
+      phase: ['provisional', 'finalized'],
+      dataState: ['observed', 'safe', 'finalized'],
+    },
+    formatFields: {},
   },
 } as const;
 
@@ -942,6 +1001,8 @@ export const PINNED_OPENAPI_AUTH_REQUIREMENTS = {
   'GET /evidence/:id/flags': { authRequired: true, scopes: ['JWT', 'ADMIN'] },
   'GET /api/v2/claims': { authRequired: false, scopes: [] },
   'GET /api/v2/claims/:id': { authRequired: false, scopes: [] },
+  'GET /api/v2/claim-read-models': { authRequired: false, scopes: [] },
+  'GET /api/v2/claim-read-models/:claimId': { authRequired: false, scopes: [] },
 } as const;
 
 // ---------------------------------------------------------------------------

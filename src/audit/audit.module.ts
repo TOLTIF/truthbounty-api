@@ -17,6 +17,7 @@ import { ComplianceService } from './services/compliance.service';
 import { SecurityMonitoringService } from './services/security-monitoring.service';
 import { AuditMetricsService } from './services/audit-metrics.service';
 import { AdminAuditService } from './services/admin-audit.service';
+import { AuditKeyRegistry, AuditStreamService } from './stream';
 import { AuditController } from './controllers/audit-log.controller';
 import { AuditLoggingInterceptor } from './interceptors/audit-logging.interceptor';
 import { AuditLogProcessor } from './processors/audit-log.processor';
@@ -52,6 +53,8 @@ import { AuditLogProcessor } from './processors/audit-log.processor';
     AuditMetricsService,
     AdminAuditService,
     AuditLogProcessor,
+    AuditKeyRegistry,
+    AuditStreamService,
   ],
   controllers: [AuditController],
   exports: [
@@ -62,6 +65,8 @@ import { AuditLogProcessor } from './processors/audit-log.processor';
     SecurityMonitoringService,
     AuditMetricsService,
     AdminAuditService,
+    AuditKeyRegistry,
+    AuditStreamService,
   ],
 })
 export class AuditModule {}

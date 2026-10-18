@@ -6,11 +6,15 @@ import {
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { AppUserRole, ROLES_KEY } from '../decorators/roles.decorator';
+import {
+  AuthenticatedRequest,
+  isAuthenticatedRequest,
+} from '../types/authenticated-request';
 
 /**
  * App-User Roles Guard (app-user plane).
  *
- * Reads the `@Roles(...)` metadata set by the app-user decorator and enforces
+ * Reads the `Roles(...)` metadata set by the app-user decorator and enforces
  * that `request.user.user.role` (Prisma UserRole) is in the required set.
  *
  * Must run AFTER JwtAuthGuard so that `request.user` is populated.
@@ -34,17 +38,17 @@ export class RolesGuard implements CanActivate {
       return true;
     }
 
-    const request = context.switchToHttp().getRequest();
+    const request = context.switchToHttp().getRequest<Request>();
 
     // Fail closed: if the JWT strategy did not attach a user, deny.
-    const authUser = request.user;
-    if (!authUser) {
+    if (!isAuthenticatedRequest(request)) {
       throw new ForbiddenException('Authentication required');
     }
 
     // The Prisma UserRole is nested as request.user.user.role
     // (set by JwtStrategy → AuthService.validateToken).
-    const role: AppUserRole | undefined = authUser.user?.role;
+    const authUser = (request as AuthenticatedRequest).user;
+    const role = authUser?.user?.role as AppUserRole | undefined;
 
     if (!role || !requiredRoles.includes(role)) {
       throw new ForbiddenException(

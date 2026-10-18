@@ -4,10 +4,11 @@ import {
   IsOptional,
   IsUrl,
   MaxLength,
+  IsArray,
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
-export class CreateClaimDto {
+export class CreateClaimDTO {
   @ApiProperty({
     description: 'Title of the claim',
     example: 'Climate change is accelerating faster than predicted',
@@ -43,4 +44,26 @@ export class CreateClaimDto {
   })
   @IsOptional()
   metadata?: Record<string, any>;
+
+  @ApiPropertyOptional({
+    description:
+      'Attachment references for the claim; scanned for secrets before persistence',
+    example: ['https://example.com/evidence.pdf'],
+    type: [String],
+  })
+  @IsOptional()
+  @IsArray()
+  @IsUrl({}, { each: true })
+  attachments?: string[];
+
+  @ApiPropertyOptional({
+    description:
+      'Support submission text scanned for secrets before persistence',
+    example: 'Please review my claim submission',
+    maxLength: 5000,
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(5000)
+  supportText?: string;
 }

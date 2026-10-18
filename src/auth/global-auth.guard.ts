@@ -2,10 +2,12 @@ import {
   Injectable,
   ExecutionContext,
   ForbiddenException,
+  UnauthorizedException,
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { AuthGuard } from '@nestjs/passport';
 import { IS_PUBLIC_KEY } from '../decorators/public.decorator';
+import { AuthenticatedPrincipal } from './types/authenticated-request';
 
 /**
  * Global Authentication Guard
@@ -34,7 +36,7 @@ export class GlobalAuthGuard extends AuthGuard('jwt') {
     const method = request.method?.toUpperCase();
     const mutationMethods = ['POST', 'PATCH', 'DELETE', 'PUT'];
 
-    if (mutationMethods.includes(method)) {
+    if (method && mutationMethods.includes(method)) {
       return super.canActivate(context);
     }
 
@@ -42,13 +44,19 @@ export class GlobalAuthGuard extends AuthGuard('jwt') {
     return true;
   }
 
-  handleRequest(err: any, user: any, info: any) {
-    if (err || !user) {
-      throw (
-        err ||
-        new ForbiddenException('Authentication required for this operation')
-      );
+  handleRequest(
+    err: unknown,
+    user: AuthenticatedPrincipal | false | null | undefined,
+    _info: unknown,
+  ): AuthenticatedPrincipal {
+    if (err) {
+      throw err instanceof Error
+        ? error
+        : new UnauthorizedException('Authentication required');
     }
-    return user;
+    if (!user || typeof user !== 'object') {
+      throw new ForbiddenException('Authentication required for this operation');
+    }
+    return user as AuthenticatedPrincipal;
   }
 }

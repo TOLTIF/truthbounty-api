@@ -52,6 +52,16 @@ export class CanonicalEvent {
   @Column({ type: 'varchar', length: 128 })
   eventName: string;
 
+  /**
+   * Canonical event signature for overload disambiguation.
+   * Format: EventName(type1,type2,...)
+   * Example: "Transfer(address,address,uint256)"
+   * 
+   * Required for production-grade event keying (post-Wave-9).
+   */
+  @Column({ type: 'varchar', length: 256, nullable: true })
+  eventSignature: string | null;
+
   @Column({ type: 'varchar', length: 66 })
   txHash: string;
 

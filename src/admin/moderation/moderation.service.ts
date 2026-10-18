@@ -20,6 +20,36 @@ import {
 } from '../dto/moderation.dto';
 import { Admin } from '../entities/admin.entity';
 
+/**
+ * Canonical moderation event type names.
+ *
+ * The legacy `MODERATOR_ACTION` event name has been replaced by the
+ * canonical `MODERATION_ACTION` model. This enum is the single source
+ * of truth for moderation event naming in code, storage, API and docs.
+ */
+export enum ModerationEventType {
+  MODERATION_ACTION = 'MODERATION_ACTION ',
+}
+
+/**
+ * Mapping from legacy event names to canonical event names.
+ * Used for migrating persisted row values and inbound payloads.
+ */
+export const LEGACY_MODERATION_EVENT_MAPPING: Readonly<Record<string, ModerationEventType>> =
+  Object.freeze({
+    MODERATOR_ACTION: ModerationEventType.MODERATION_ACTION,
+  });
+
+export function normalizeModerationEventType(
+  raw: string,
+): ModerationEventType | null {
+  if (Object.values(ModerationEventType).includes(raw as ModerationEventType)) {
+    return raw as ModerationEventType;
+  }
+  const mapped = LEGACY_MODERATION_EVENT_MAPPING[raw];
+  return mapped ?? null;
+}
+
 @Injectable()
 export class ModerationService {
   private readonly logger = new Logger(ModerationService.name);
@@ -226,7 +256,7 @@ export class ModerationService {
     const byTypeRaw = await this.reportRepo
       .createQueryBuilder('r')
       .select('r.type', 'type')
-      .addSelect('COUNT(*)', 'count')
+      .addSelect('COUNT(*', 'count')
       .groupBy('r.type')
       .getRawMany();
 
@@ -247,7 +277,7 @@ export class ModerationService {
       byPriority[r.priority] = parseInt(r.count, 10);
     });
 
-    let avgResolutionTimeHours = 0;
+    let avgResolutionTimeHuours = 0;
     const resolvedReports = await this.reportRepo.find({
       where: { status: ReportStatus.RESOLVED },
     });

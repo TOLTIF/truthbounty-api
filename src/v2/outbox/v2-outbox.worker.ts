@@ -197,19 +197,18 @@ export class V2OutboxWorker implements OnModuleDestroy {
   /**
    * Atomically claim up to POLL_BATCH_SIZE PENDING rows.
    *
-   * Uses `FOR UPDATE SKIP LOCKED` to avoid blocking other workers and to
-   * prevent the same row from being claimed twice. All claimed rows are
-   * immediately set to PROCESSING with a deadline in the same transaction.
-   *
-   * SQLite (used in integration tests) does not support `FOR UPDATE SKIP LOCKED`
-   * so the lock mode degrades gracefully; the correctness properties are
-   * verified against the behaviour under PostgreSQL.
+   * Uses `FOR UPDATE SKIP LOCKED` inside a transaction. To guarantee mutual
+   * exclusion even when SKIP LOCKED is unsupported (e.g. SQLite test harnesses)
+   * or when competing workers race on the same batch, each row is claimed
+   * via an atomic conditional UPDATE (`WHERE id = :id AND status = 'PENDING'`).
+   * Only rows whose state actually transitioned to PROCESSING are claimed
+   * and returned.
    */
   private async claimBatch(): Promise<V2OutboxMessage[]> {
     return this.dataSource.transaction(async (manager: EntityManager) => {
       const repo = manager.getRepository(V2OutboxMessage);
 
-      // Select pending rows scheduled for now or earlier, ordered for FIFO
+      // Select candidate pending rows scheduled for now or earlier, ordered for FIFO
       // delivery, locked for exclusive update, skipping rows already locked
       // by another worker instance.
       const rows = await repo
@@ -224,27 +223,32 @@ export class V2OutboxWorker implements OnModuleDestroy {
 
       if (rows.length === 0) return [];
 
-      // Transition each claimed row to PROCESSING with a deadline.
       const deadline = new Date(
         Date.now() + PROCESSING_DEADLINE_SECONDS * 1000,
       );
-      const ids = rows.map((r) => r.id);
+      const claimed: V2OutboxMessage[] = [];
 
-      await repo
-        .createQueryBuilder()
-        .update()
-        .set({
-          status: V2OutboxStatus.PROCESSING,
-          processingDeadline: deadline,
-        })
-        .whereInIds(ids)
-        // Double-check status inside the lock to guard against a race between
-        // claim and the update (should be impossible with FOR UPDATE, but
-        // explicit is safer and documents the invariant).
-        .andWhere('status = :status', { status: V2OutboxStatus.PENDING })
-        .execute();
+      // Atomically lock each row individually to guard against races
+      for (const row of rows) {
+        const result = await repo
+          .createQueryBuilder()
+          .update(V2OutboxMessage)
+          .set({
+            status: V2OutboxStatus.PROCESSING,
+            processingDeadline: deadline,
+          })
+          .where('id = :id', { id: row.id })
+          .andWhere('status = :status', { status: V2OutboxStatus.PENDING })
+          .execute();
 
-      return rows;
+        if ((result.affected ?? 0) > 0) {
+          row.status = V2OutboxStatus.PROCESSING;
+          row.processingDeadline = deadline;
+          claimed.push(row);
+        }
+      }
+
+      return claimed;
     });
   }
 
@@ -253,6 +257,7 @@ export class V2OutboxWorker implements OnModuleDestroy {
   /**
    * Dispatch one claimed message to BullMQ.
    *
+   * Validates event type and payload invariants before relay.
    * Success: transitions to DISPATCHED, records jobId and processedAt.
    * Transient failure: increments retryCount, resets to PENDING for next cycle.
    * Permanent failure (maxRetries exceeded or non-retryable): transitions to DEAD_LETTER.
@@ -262,6 +267,16 @@ export class V2OutboxWorker implements OnModuleDestroy {
    */
   private async dispatchOne(msg: V2OutboxMessage): Promise<void> {
     try {
+      // Validate event type syntax before dispatch (fail-closed against unknown/unapproved types)
+      const validEventTypeRegex = /^[a-z0-9_-]+(\.[a-z0-9_-]+)+$/;
+      if (!validEventTypeRegex.test(msg.eventType)) {
+        await this.deadLetterInvalidMessage(
+          msg,
+          `Unknown or invalid eventType: ${msg.eventType}`,
+        );
+        return;
+      }
+
       const retryBehavior = determineRetryBehavior(
         new Error(msg.lastError ?? 'initial'),
         msg.retryCount,
@@ -294,13 +309,17 @@ export class V2OutboxWorker implements OnModuleDestroy {
         },
       );
 
-      await this.dataSource.getRepository(V2OutboxMessage).update(msg.id, {
-        status: V2OutboxStatus.DISPATCHED,
-        jobId: String(job.id ?? ''),
-        processedAt: new Date(),
-        processingDeadline: null,
-        lastError: null,
-      });
+      // Guarded completion transition: only complete if still in PROCESSING state
+      await this.dataSource.getRepository(V2OutboxMessage).update(
+        { id: msg.id, status: V2OutboxStatus.PROCESSING },
+        {
+          status: V2OutboxStatus.DISPATCHED,
+          jobId: String(job.id ?? ''),
+          processedAt: new Date(),
+          processingDeadline: null,
+          lastError: null,
+        },
+      );
 
       this.metricsService.incrementCounter('v2_outbox_dispatched_total', 1);
       this.logger.debug(
@@ -309,6 +328,28 @@ export class V2OutboxWorker implements OnModuleDestroy {
     } catch (err) {
       await this.handleDispatchFailure(msg, err as Error);
     }
+  }
+
+  /**
+   * Immediately dead-letter a message that fails validation or is invalid.
+   */
+  private async deadLetterInvalidMessage(
+    msg: V2OutboxMessage,
+    reason: string,
+  ): Promise<void> {
+    const errorText = reason.slice(0, 1000);
+    await this.dataSource.getRepository(V2OutboxMessage).update(
+      { id: msg.id, status: V2OutboxStatus.PROCESSING },
+      {
+        status: V2OutboxStatus.DEAD_LETTER,
+        lastError: errorText,
+        processingDeadline: null,
+      },
+    );
+    this.metricsService.incrementCounter('v2_outbox_dead_lettered_total', 1);
+    this.logger.error(
+      `V2OutboxMessage ${msg.id} dead-lettered due to validation error: ${errorText}`,
+    );
   }
 
   /**
@@ -330,12 +371,16 @@ export class V2OutboxWorker implements OnModuleDestroy {
 
     const errorText = String(err?.message ?? 'Unknown dispatch error').slice(0, 1000);
 
-    await this.dataSource.getRepository(V2OutboxMessage).update(msg.id, {
-      retryCount: newRetryCount,
-      lastError: errorText,
-      status: isDead ? V2OutboxStatus.DEAD_LETTER : V2OutboxStatus.PENDING,
-      processingDeadline: null,
-    });
+    // Guarded transition: only update if still in PROCESSING state
+    await this.dataSource.getRepository(V2OutboxMessage).update(
+      { id: msg.id, status: V2OutboxStatus.PROCESSING },
+      {
+        retryCount: newRetryCount,
+        lastError: errorText,
+        status: isDead ? V2OutboxStatus.DEAD_LETTER : V2OutboxStatus.PENDING,
+        processingDeadline: null,
+      },
+    );
 
     if (isDead) {
       this.metricsService.incrementCounter('v2_outbox_dead_lettered_total', 1);

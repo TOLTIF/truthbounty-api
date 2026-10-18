@@ -42,6 +42,12 @@ export interface CircuitBreakerOptions {
     durationMs: number,
     state: CircuitState,
   ) => void;
+  /**
+   * Decide whether an error indicates dependency health failure. This breaker
+   * never retries calls; returning false only prevents the error from opening
+   * the circuit (for example, caller validation or authorization errors).
+   */
+  shouldCountFailure?: (error: unknown) => boolean;
 }
 
 /** Thrown when a call is attempted while the circuit is OPEN. */
@@ -82,12 +88,16 @@ export class CircuitBreaker {
   private lastFailureAt: number | null = null;
   private lastSuccessAt: number | null = null;
   private openedAt: number | null = null;
+  private halfOpenProbeInFlight = false;
 
   private readonly failureThreshold: number;
   private readonly successThreshold: number;
   private readonly resetMs: number;
   private readonly onStateChange?: CircuitBreakerOptions['onStateChange'];
   private readonly onCall?: CircuitBreakerOptions['onCall'];
+  private readonly shouldCountFailure: NonNullable<
+    CircuitBreakerOptions['shouldCountFailure']
+  >;
 
   constructor(private readonly options: CircuitBreakerOptions) {
     this.failureThreshold = options.failureThreshold ?? 5;
@@ -95,6 +105,7 @@ export class CircuitBreaker {
     this.resetMs = options.resetMs ?? 30_000;
     this.onStateChange = options.onStateChange;
     this.onCall = options.onCall;
+    this.shouldCountFailure = options.shouldCountFailure ?? (() => true);
   }
 
   get name(): string {
@@ -115,9 +126,12 @@ export class CircuitBreaker {
   async call<T>(fn: () => Promise<T>, timeoutMs?: number): Promise<T> {
     this.maybeTransitionFromOpen();
 
-    if (this.state === 'OPEN') {
+    if (this.state === 'OPEN' || (this.state === 'HALF_OPEN' && this.halfOpenProbeInFlight)) {
       throw new CircuitOpenError(this.options.name);
     }
+
+    const isHalfOpenProbe = this.state === 'HALF_OPEN';
+    if (isHalfOpenProbe) this.halfOpenProbeInFlight = true;
 
     const start = Date.now();
     this.totalCalls++;
@@ -132,6 +146,8 @@ export class CircuitBreaker {
     } catch (err) {
       this.onFailure(err, Date.now() - start);
       throw err;
+    } finally {
+      if (isHalfOpenProbe) this.halfOpenProbeInFlight = false;
     }
   }
 
@@ -182,14 +198,16 @@ export class CircuitBreaker {
   private onFailure(err: unknown, durationMs: number): void {
     this.lastFailureAt = Date.now();
     this.totalFailures++;
-    this.failures++;
-    this.successes = 0;
+    if (this.shouldCountFailure(err)) {
+      this.failures++;
+      this.successes = 0;
 
-    if (
-      (this.state === 'CLOSED' || this.state === 'HALF_OPEN') &&
-      this.failures >= this.failureThreshold
-    ) {
-      this.transition('OPEN');
+      if (
+        (this.state === 'CLOSED' || this.state === 'HALF_OPEN') &&
+        this.failures >= this.failureThreshold
+      ) {
+        this.transition('OPEN');
+      }
     }
 
     this.onCall?.(this.options.name, false, durationMs, this.state);

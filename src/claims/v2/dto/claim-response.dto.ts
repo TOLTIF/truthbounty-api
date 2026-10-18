@@ -20,6 +20,9 @@ export class ClaimLinksDto {
 
   @ApiPropertyOptional({ description: 'Stakes collection URL' })
   stakes?: string;
+
+  @ApiPropertyOptional({ description: 'Settlement and reward projection URL' })
+  settlement?: string;
 }
 
 export class ClaimFeedItemDto {

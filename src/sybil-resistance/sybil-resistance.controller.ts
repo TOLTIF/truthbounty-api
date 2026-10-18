@@ -8,6 +8,10 @@ import {
 } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { SybilResistanceService } from './sybil-resistance.service';
+import {
+  RecomputeScoreOptions,
+  SybilAppealRequestDto,
+} from './sybil-resistance.types';
 
 @ApiTags('sybil')
 @Controller('sybil')
@@ -36,6 +40,67 @@ export class SybilResistanceController {
       throw new BadRequestException('User ID is required');
     }
     return this.sybilResistanceService.getLatestSybilScore(userId);
+  }
+
+  /**
+   * Get privacy-safe public view of Sybil score (strictly redacting sensitive data)
+   */
+  @Get('users/:userId/public-score')
+  async getPublicScore(@Param('userId') userId: string) {
+    if (!userId || userId.trim() === '') {
+      throw new BadRequestException('User ID is required');
+    }
+    return this.sybilResistanceService.getPublicSybilScore(userId);
+  }
+
+  /**
+   * Deterministic recomputation path with optional pinned version and authority binding
+   */
+  @Post('users/:userId/recompute')
+  async recomputeScore(
+    @Param('userId') userId: string,
+    @Body() options?: RecomputeScoreOptions,
+  ) {
+    if (!userId || userId.trim() === '') {
+      throw new BadRequestException('User ID is required');
+    }
+    return this.sybilResistanceService.recomputeScore(userId, options);
+  }
+
+  /**
+   * Submit an appeal against an unfavorable Sybil score evaluation
+   */
+  @Post('users/:userId/appeal')
+  async submitAppeal(
+    @Param('userId') userId: string,
+    @Body() body: SybilAppealRequestDto,
+  ) {
+    if (!userId || userId.trim() === '') {
+      throw new BadRequestException('User ID is required');
+    }
+    if (!body || !body.reason) {
+      throw new BadRequestException('Appeal reason is required');
+    }
+    return this.sybilResistanceService.submitAppeal(userId, body);
+  }
+
+  /**
+   * Get appeal history for a user
+   */
+  @Get('users/:userId/appeals')
+  async getAppeals(@Param('userId') userId: string) {
+    if (!userId || userId.trim() === '') {
+      throw new BadRequestException('User ID is required');
+    }
+    return this.sybilResistanceService.getAppeals(userId);
+  }
+
+  /**
+   * List available Sybil score model versions
+   */
+  @Get('models')
+  async getModels() {
+    return this.sybilResistanceService.getModelVersions();
   }
 
   /**
