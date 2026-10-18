@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { V2EventsModule } from '../events/v2-events.module';
+import { V2OutboxModule } from '../outbox/v2-outbox.module';
 import { ProjectEvidence } from './entities/project-evidence.entity';
 import { ProjectEvidenceVersion } from './entities/project-evidence-version.entity';
 import { ProjectorCursor } from '../common/entities/projector-cursor.entity';
@@ -20,6 +21,7 @@ import {
       ProjectorCursor,
     ]),
     V2EventsModule,
+    V2OutboxModule,
   ],
   controllers: [EvidenceController, EvidenceIntegrityController],
   providers: [

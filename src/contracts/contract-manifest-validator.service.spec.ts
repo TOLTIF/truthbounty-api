@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { createHash } from 'crypto';
 import { ethers } from 'ethers';
 import { ContractManifestValidatorService } from './contract-manifest-validator.service';
+import { AbiValidationService } from './abi-validation.service';
 import {
   ContractAddressManifest,
   ManifestContractEntry,
@@ -102,6 +103,7 @@ describe('ContractManifestValidatorService', () => {
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
+        AbiValidationService,
         ContractManifestValidatorService,
         { provide: ConfigService, useValue: { get: configGet } },
       ],

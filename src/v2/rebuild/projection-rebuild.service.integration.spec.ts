@@ -14,6 +14,7 @@ import { ProjectorCursor } from '../common/entities/projector-cursor.entity';
 import { IndexingAnomaly } from '../common/entities/indexing-anomaly.entity';
 import { ProjectEvidence } from '../evidence/entities/project-evidence.entity';
 import { ProjectEvidenceVersion } from '../evidence/entities/project-evidence-version.entity';
+import { V2OutboxService } from '../outbox/v2-outbox.service';
 import { EvidenceProjectorService } from '../evidence/evidence-projector.service';
 import { ProjectVerificationRound } from '../verification/entities/project-verification-round.entity';
 import { ProjectParticipantPosition } from '../verification/entities/project-participant-position.entity';
@@ -71,6 +72,15 @@ describe('ProjectionRebuildService (integration)', () => {
         ProjectionRebuildService,
         CanonicalEventQueryService,
         EvidenceProjectorService,
+        {
+          provide: V2OutboxService,
+          useValue: {
+            publishWithManager: jest.fn().mockResolvedValue({
+              id: 'test-outbox-message',
+              idempotencyKey: 'test-idempotency-key',
+            }),
+          },
+        },
         VerificationProjectorService,
         DisputesProjectorService,
         RewardsProjectorService,

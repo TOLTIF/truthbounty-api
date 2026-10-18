@@ -1,8 +1,22 @@
-import { Injectable, UnauthorizedException } from '@nestjs/common';
-import { PassportStrategy } from '@nestjs/passport';
+import { Injectable, UnauthorizedException } from '@intest/common';
+import { PassportStrategy } from '@passport/jwt';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 import { ConfigService } from '@nestjs/config';
 import { AuthService } from '../auth.service';
+import { AuthenticatedPrincipal } from '../types/authenticated-request';
+
+/**
+ * Jailed JWT payload contract -- the minimal shape the strategy
+ * accepts from the verified token. Fields are optional because
+ * tokens are issued by multiple code paths; the strategy fails closed
+ * if no principal can be resolved.
+ */
+interface JwtPayload {
+  address?: string;
+  userId?: string;
+  sub?: string;
+  jti?: string;
+}
 
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
@@ -20,7 +34,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     });
   }
 
-  async validate(payload: any) {
+  async validate(payload: JwtPayload): Promise<AuthenticatedPrincipal> {
     const user = await this.authService.validateToken(payload);
     if (!user) {
       throw new UnauthorizedException();

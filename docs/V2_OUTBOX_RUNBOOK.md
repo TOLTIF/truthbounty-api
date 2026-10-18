@@ -234,6 +234,26 @@ The `payload` field is routing metadata only. It **must not** contain:
 
 Use opaque IDs and channel routing hints only.
 
+### Chain provenance binding
+
+When outbox messages relay events or side-effects derived from on-chain activity,
+bind `chainProvenance` to enforce protocol provenance:
+- `chainId`: positive EVM chain ID (e.g. 11155420 for OP Sepolia)
+- `releaseId`: canonical contract release version (e.g. "v2.0.0-sepolia")
+- `deploymentBlock`: non-negative contract deployment block number
+- `artifactChecksum`: 64-character lowercase hexadecimal SHA-256 hash of the canonical ABI artifact
+
+When present, `chainProvenance` is cryptographically bound into the `idempotencyKey`
+to prevent cross-chain or cross-release replay collisions.
+
+### Auditable delivery history
+
+Operators and services can query the delivery history and audit trail via `V2OutboxService`:
+- `getDeliveryHistory(aggregateType, aggregateId)`: chronologically ordered delivery attempts and states for any aggregate.
+- `getMessageByIdempotencyKey(key)`: inspect delivery status and external `jobId` for a specific idempotency key.
+- `getDeliveryAudit({ status, aggregateType, limit, offset })`: paginated audit across the entire outbox table.
+- `replayDeadLetter(id)`: programmatically reset a `DEAD_LETTER` message to `PENDING` with full fail-closed state validation.
+
 ---
 
 ## Developer: importing the module

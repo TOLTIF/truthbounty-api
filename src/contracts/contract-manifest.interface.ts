@@ -34,6 +34,18 @@ export type AllowedChainId = (typeof ALLOWED_CHAIN_IDS)[number];
  */
 export const DEFAULT_MANIFEST_MAX_AGE_DAYS = 90;
 
+/**
+ * Indexed parameter metadata for validation and drift detection.
+ */
+export interface IndexedParameterMetadata {
+  /** Parameter name as it appears in the ABI. */
+  name: string;
+  /** Solidity type, e.g. "address", "uint256", "bytes32". */
+  type: string;
+  /** Zero-based position in the parameter list. */
+  position: number;
+}
+
 /** A single ABI event fragment entry inside a manifest contract. */
 export interface ManifestEventFragment {
   /** Event name, e.g. "Staked". */
@@ -47,8 +59,34 @@ export interface ManifestEventFragment {
    * Optional keccak256 topic-0 for this event, used to cross-check the ABI
    * fragment independently. Example: "0x...".
    * When present, must match ethers.id(canonicalAbiSignature).
+   * 
+   * REQUIRED for production manifests (post-Wave-9).
+   * NULL for anonymous events (which do not emit topic0).
    */
-  topic0?: string;
+  topic0?: string | null;
+  /**
+   * Whether this event is declared with the `anonymous` keyword.
+   * Anonymous events do not emit topic0, allowing up to 4 indexed parameters
+   * instead of the usual 3. Default: false.
+   * 
+   * REQUIRED for production manifests (post-Wave-9).
+   */
+  anonymous?: boolean;
+  /**
+   * Canonical signature for this event, e.g. "Transfer(address,address,uint256)".
+   * Used for signature-based event keying instead of name-only keying.
+   * 
+   * REQUIRED for production manifests (post-Wave-9) to support overload detection.
+   */
+  signature?: string;
+  /**
+   * Indexed parameters metadata for drift detection and layout validation.
+   * Order, types, and count must remain stable across manifest versions to
+   * ensure log decoding compatibility.
+   * 
+   * REQUIRED for production manifests (post-Wave-9).
+   */
+  indexed?: IndexedParameterMetadata[];
 }
 
 /** A single contract entry inside the manifest. */
@@ -100,6 +138,7 @@ export interface ManifestContractValidationResult {
   address: string;
   valid: boolean;
   errors: string[];
+  warnings: string[];
 }
 
 /** Aggregated result of a full manifest validation run. */
@@ -111,6 +150,8 @@ export interface ManifestValidationReport {
   contractResults: ManifestContractValidationResult[];
   /** All error strings collected across the manifest. */
   errors: string[];
+  /** All warning strings collected across the manifest. */
+  warnings: string[];
   /** Age of the manifest in days at validation time (informational). */
   manifestAgedays?: number;
 }

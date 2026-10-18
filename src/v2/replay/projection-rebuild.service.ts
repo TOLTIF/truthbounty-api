@@ -148,7 +148,7 @@ export class ProjectionRebuildService {
       for (const event of batch) {
         if (event.chainId !== options.binding.chainId) {
           errors.push(
-            `chain mismatch at \( {event.txHash}: \){event.logIndex} — fail closed`,
+            `chain mismatch at ${event.txHash}:${event.logIndex} — fail closed`,
           );
           return this.finish(options, startedAt, {
             eventsRead,

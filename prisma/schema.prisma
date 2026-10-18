@@ -8,7 +8,7 @@ generator client {
 }
 
 // Actual runtime datasource is SQLite via the libsql driver adapter
-// (see src/prisma/prisma.service.ts, DATABASE_URL=file:./dev.db) this 
+// (see src/prisma/prisma.service.ts, DATABASE_URL="file:./dev.db") this 
 // matches prisma/migrations/migration_lock.toml, which already records
 // "sqlite" as the migration dialect. Declaring "postgresql" here caused
  // PrismaClientInitializationError at runtime ("Driver Adapter
@@ -162,7 +162,7 @@ model AiUsageMetric {
   provider        String   // e.g., "openai", "anthropic"
   model           String
   promptTokens    Int      @default(0)
-  completionTokens Int     @default(0)
+  completionTokens Int      @default(0)
   totalTokens     Int      @default(0)
   latencyMs       Int      @default(0)
   createdAt       DateTime @default(now())
@@ -232,9 +232,9 @@ model MonitoringMetric {
   @@index([name, recordedAt])
 }
 
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 // Transactional Outbox (V2-BE-048)
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 // OutboxEvent rows are written inside the same DB transaction as any
 // projection change. A background poller claims PENDING rows and relays
 // them to BullMQ, then marks them DISPATCHED.  The processor enforces
@@ -243,7 +243,7 @@ model MonitoringMetric {
 // Security: payload stores only non-sensitive routing metadata (aggregateId,
 // eventType, recipientIds). No private claim text, user PII, or settlement
 // data is persisted here.
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 model OutboxEvent {
   id             String   @id @default(uuid())
   // Domain event type, e.g. "notification.send", "webhook.deliver"
@@ -271,12 +271,12 @@ model OutboxEvent {
   @@index([eventType, status])
 }
 
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 // V2 indexer: block cursor + reorg ancestry
-// Supports src/v2/block-cursor (reorg detection by walking parentHash back to
+// Supports src/v2/block-cursor (reorg detection y walking parentHash back to
 // a common ancestor). Heights are BigInt because some EVM chains exceed
 // Number.MAX_SAFE_INTEGER.
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 
 model BlockCursor {
   id     String @id @default(uuid())
@@ -319,12 +319,12 @@ model BlockCursorAncestor {
   @@index([cursorId, isCanonical])
 }
 
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 // V2 indexer: canonical-identity dedup for raw EVM logs.
 // A replay of the same (chainId, blockHash, txHash, logIndex) is rejected;
 // the same log position under a different block hash is retained so reorgs
 // stay diagnosable.
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 
 model ChainEvent {
   id              String   @id @default(uuid())
@@ -342,9 +342,105 @@ model ChainEvent {
   // JSON-encoded RawChainLog.rawArgs
   rawArgs         String
 
-ingestedAt DateTime @default(now())
+  ingestedAt DateTime @default(now())
 
   @@unique([chainId, blockHash, txHash, logIndex])
   @@index([chainId, txHash, logIndex])
   @@index([eventName, blockNumber])
+}
+
+// ----------------------------------------------------------------------------
+// PREWAVE-BE-079: Secret detection & quarantine for support submissions.
+// Support text/attachments are scanned for seed phrases, private keys,
+// tokens, auth headers, credentials, and protected evidence before
+// persistence or forwarding. High-confidence detections are quarantined
+// here instead of being stored inline, and access is restricted/audited.
+// Detected secret material is never echoed into logs/notifications.
+// ----------------------------------------------------------------------------
+
+model SupportSubmission {
+  id        String   @id @default(uuid())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Opaque reference to the submitting user; no PII stored inline.
+  userId String?
+
+  // Sanitized/redacted text safe for persistence and forwarding.
+  sanitizedText String @default("")
+
+  // Quarantine status for this submission.
+  // clean | quarantined | released
+  status String @default("clean")
+
+  // High-confidence detection count (secret material redacted before storage).
+  detectionCount Int @default(0)
+
+  // Detection categories found (JSON array of classifier labels, no secret values).
+  detectionTypes String @default("[]")
+
+  // Opaque reference to quarantined attachment blob, if any.
+  quarantineRef String?
+
+  // Secure remediation guidance surfaced to the user (no secret material).
+  remediationGuidance String?
+
+  // Audit trail for quarantine access.
+  quarantinedAt DateTime?
+  reviewedBy    String?
+  reviewedAt    DateTime?
+
+  attachments SupportAttachment[]
+
+  @@index([status, createdAt])
+  @@index([userId])
+}
+
+model SupportAttachment {
+  id           String   @id @default(uuid())
+  createdAt      DateTime @default(now())
+
+  submissionId String
+  submission   SupportSubmission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+
+  // Original filename (not trusted for path resolution).
+  filename     String
+  // MIME type as declared by the client.
+  contentType  String
+  // Size in bytes.
+  size         Int
+
+  // Sha256 of the attachment content for deduplication and integrity.
+  contentHash  String
+
+  // Storage key for the quarantined blob (never inline in this row).
+  quarantineKey String?
+
+  // clean | quarantined | released
+  status        String @default("clean")
+
+  // Detection categories (JSON array of classifier labels, no secret values).
+  detectionTypes String @default("[]")
+
+  @@index([submissionId])
+  @@index([contentHash])
+  @@index([status])
+}
+
+model QuarantineAuditLog {
+  id        String   @id @default(uuid())
+  createdAt  DateTime @default(now())
+
+  // Opaque actor reference (user id or system actor).
+  actorId    String?
+  // read | release | delete | create
+  action      String
+  // Opaque reference to the quarantined record (submission or attachment).
+  targetType  String
+  targetId    String
+  // Non-sensitive context (JSON); never contains secret material.
+  context     String @default("{}")
+
+  @@index([targetType, targetId])
+  @@index([actorId, createdAt])
 }

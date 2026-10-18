@@ -226,6 +226,34 @@ describe('DependencyGuardService — auto-registration', () => {
     expect(result).toBe('ok');
     expect(svc.snapshot('storage').state).toBe('CLOSED');
   });
+
+  it('forwards failure classification to the named dependency breaker', async () => {
+    const svc = await makeGuard();
+    svc.register('classified', {
+      failureThreshold: 1,
+      shouldCountFailure: (error) => !(error instanceof TypeError),
+    });
+    await expect(
+      svc.guard('classified', () => Promise.reject(new TypeError('invalid input'))),
+    ).rejects.toThrow('invalid input');
+    expect(svc.snapshot('classified').state).toBe('CLOSED');
+    expect(svc.snapshot('classified').totalFailures).toBe(1);
+  });
+
+  it('bounds custom dependency names and rejects labels that could leak or explode metrics', async () => {
+    const svc = await makeGuard();
+    for (let i = 0; i < 27; i++) {
+      await svc.guard(`custom-${i}`, succeed);
+    }
+    expect(svc.status()).toHaveLength(32);
+    await expect(svc.guard('custom-27', succeed)).rejects.toThrow(
+      /maximum registered dependency circuits/i,
+    );
+    await expect(svc.guard('rpc-secret-value', succeed)).rejects.toThrow(
+      /stable lowercase identifier/i,
+    );
+    expect(svc.status()).toHaveLength(32);
+  });
 });
 
 // ---------------------------------------------------------------------------

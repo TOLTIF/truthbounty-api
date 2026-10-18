@@ -16,6 +16,7 @@ import {
 } from './interfaces/blockchain-event.interface';
 import { ClaimsCache } from '../cache/claims.cache';
 import { SequentialQueue } from './utils/sequential-queue';
+import { ReadinessService } from '../readiness/readiness.service';
 
 @Injectable()
 export class BlockchainIndexerService {
@@ -39,6 +40,7 @@ export class BlockchainIndexerService {
     private dataSource: DataSource,
     private stateService: BlockchainStateService,
     private claimsCache: ClaimsCache,
+    private readinessService: ReadinessService,
   ) {}
 
   /**
@@ -105,6 +107,15 @@ export class BlockchainIndexerService {
 
       await queryRunner.commitTransaction();
       this.logger.log(`Processed event: ${eventType} at block ${blockNumber}`);
+
+      // Record a fresh successful observation so readiness reflects the
+      // indexer's liveness and projection progress. A stale last-success
+      // (no recent observation) must never report healthy.
+      await this.readinessService.recordIndexerObservation({
+        observedAt: new Date(),
+        lastSuccessAt: new Date(),
+        blockNumber,
+      });
 
       // Invalidate cache after successfully committing a projection change.
       // Passing the actual affected claim IDs (an empty array included)
@@ -177,6 +188,10 @@ export class BlockchainIndexerService {
         `Rolled back ${orphaned.length} event(s); checkpoint rewound to block ${rewoundTo}`,
       );
       await this.stateService.recordReplay(orphaned.length);
+
+      // A reorg invalidates prior observations: readiness must not report
+      // healthy until a fresh successful observation is recorded.
+      await this.readinessService.recordIndexerReorg(rewoundTo);
 
       // Invalidate all cache after rolling back events during a reorg
       // This is critical to ensure we never serve stale data based on orphaned chain state

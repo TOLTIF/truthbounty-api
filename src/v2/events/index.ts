@@ -10,4 +10,6 @@ export * from './event-schema-registry';
 export * from './canonical-events.service';
 export * from './canonical-event-query.service';
 export * from './reorg-rollback.service';
+export * from './decoder-allowlist';
+export * from './optimism-sepolia-boundary';
 export * from './v2-events.module';

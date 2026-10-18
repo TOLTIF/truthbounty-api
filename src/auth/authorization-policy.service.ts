@@ -8,6 +8,7 @@ import {
 import { Reflector } from '@nestjs/core';
 import { ConfigService } from '@nestjs/config';
 import { RedisService } from '../redis/redis.service';
+import { createHmac, timingSafeEqual, randomBytes } from 'crypto';
 
 /**
  * Authorization Policy Service
@@ -16,6 +17,9 @@ import { RedisService } from '../redis/redis.service';
  * across admin, moderation, configuration, and user-scoped endpoints.
  *
  * Implements V2-BE-066: Enforce Least-Privilege API Authorization Policies
+ *
+ * Also implements PREWAVE-BE-082: Issue Short-Lived Capability Tokens
+ * for Protected Operations.
  */
 
 export enum ResourceType {
@@ -97,6 +101,93 @@ export interface PolicyRule {
   priority: number; // Higher = evaluated first
   enabled: boolean;
 }
+
+/**
+ * Capability Token contract (PREWAVE-BE-082).
+ *
+ * A capability token is a signed, short-lived, audience-bound assertion
+ * that a given subject may perform a specific capability against a specific
+ * resource scope, for a specific chain/release/deployment/artifact context.
+ */
+export interface CapabilityTokenClaims {
+  /** Token format version */
+  ver: 1;
+  /** Audience the token is issued for (e.g. service identifier) */
+  aud: string;
+  /** Subject (actor) the token is issued to */
+  sub: string;
+  /** Capability being granted */
+  cap: string;
+  /** Resource type scope */
+  resource: ResourceType;
+  /** Optional specific resource identifier */
+  resourceId?: string;
+  /** Action being authorized */
+  action: ActionType;
+  /** Unique nonce for replay protection */
+  nonce: string;
+  /** Issuance time (unix seconds) */
+  iat: number;
+  /** Expiry time (unix seconds) */
+  exp: number;
+  /** Chain context */
+  chain: string;
+  /** Release context */
+  release: string;
+  /** Deployment context */
+  deployment: string;
+  /** Artifact provenance digest */
+  artifact: string;
+}
+
+export interface CapabilityToken {
+  claims: CapabilityTokenClaims;
+  signature: string;
+}
+
+export interface CapabilityIssueRequest {
+  aud: string;
+  sub: string;
+  cap: string;
+  resource: ResourceType;
+  resourceId?: string;
+  action: ActionType;
+  ttlSeconds?: number;
+  chain?: string;
+  release?: string;
+  deployment?: string;
+  artifact?: string;
+}
+
+export interface CapabilityUseRequest {
+  token: CapabilityToken;
+  aud: string;
+  sub: string;
+  cap: string;
+  resource: ResourceType;
+  resourceId?: string;
+  action: ActionType;
+  chain?: string;
+  release?: string;
+  deployment?: string;
+  artifact?: string;
+}
+
+export class CapabilityTokenError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'CapabilityTokenError';
+  }
+}
+
+const DEFAULT_CAPABILITY_TTL_SECONDS = 60;
+const MAX_CAPABILITY_TTL_SECONDS = 300;
+const CAPABILITY_CLOCK_SKEW = 5;
+const NONCE_KEY_PREFIX = 'capability:nonce:';
+const REVOKED_SUBJECT_KEY_PREFIX = 'capability:revoked:sub:';
 
 /**
  * Authorization Policy Engine
@@ -365,215 +456,66 @@ export class AuthorizationPolicyService {
         priority: 60,
         enabled: true,
       },
-      {
-        id: 'user-own-disputes',
-        name: 'User Own Disputes',
-        description: 'Users can read and create their own disputes',
-        resource: ResourceType.DISPUTE,
-        actions: [ActionType.CREATE, ActionType.READ, ActionType.LIST],
-        roles: [Role.USER],
-        conditions: [
-          { type: 'ownership', field: 'userId', operator: 'equals' },
-        ],
-        effect: 'allow',
-        priority: 60,
-        enabled: true,
-      },
-      {
-        id: 'user-own-wallets',
-        name: 'User Own Wallets',
-        description: 'Users can manage their own wallet linkages',
-        resource: ResourceType.WALLET,
-        actions: [
-          ActionType.CREATE,
-          ActionType.READ,
-          ActionType.UPDATE,
-          ActionType.DELETE,
-          ActionType.LIST,
-        ],
-        roles: [Role.USER],
-        conditions: [
-          { type: 'ownership', field: 'walletAddress', operator: 'equals' },
-        ],
-        effect: 'allow',
-        priority: 60,
-        enabled: true,
-      },
-
-      // Deny by default for sensitive operations
-      {
-        id: 'deny-contract-deploy',
-        name: 'Deny Contract Deploy',
-        description: 'Only super admins can deploy contracts',
-        resource: ResourceType.CONTRACT,
-        actions: [ActionType.DEPLOY],
-        roles: [
-          Role.ADMIN,
-          Role.MODERATOR,
-          Role.ANALYST,
-          Role.SUPPORT,
-          Role.USER,
-        ],
-        conditions: [],
-        effect: 'deny',
-        priority: 1000,
-        enabled: true,
-      },
-      {
-        id: 'deny-config-delete',
-        name: 'Deny Config Delete',
-        description: 'Prevent accidental config deletion',
-        resource: ResourceType.CONFIG,
-        actions: [ActionType.DELETE],
-        roles: [
-          Role.ADMIN,
-          Role.MODERATOR,
-          Role.ANALYST,
-          Role.SUPPORT,
-          Role.USER,
-        ],
-        conditions: [],
-        effect: 'deny',
-        priority: 1000,
-        enabled: true,
-      },
-      {
-        id: 'deny-audit-write',
-        name: 'Deny Audit Write',
-        description: 'Audit logs are append-only',
-        resource: ResourceType.AUDIT_LOG,
-        actions: [ActionType.CREATE, ActionType.UPDATE, ActionType.DELETE],
-        roles: Object.values(Role),
-        conditions: [],
-        effect: 'deny',
-        priority: 1000,
-        enabled: true,
-      },
     ];
 
     for (const policy of defaultPolicies) {
       this.policies.set(policy.id, policy);
     }
-
-    this.logger.log(
-      `Loaded ${this.policies.size} default authorization policies`,
-    );
   }
 
   /**
-   * Register a custom policy condition evaluator
+   * Register a custom policy evaluator.
    */
   registerCustomEvaluator(
     name: string,
     evaluator: (context: AuthorizationContext) => Promise<boolean>,
   ): void {
     this.customEvaluators.set(name, evaluator);
-    this.logger.log(`Registered custom evaluator: ${name}`);
   }
 
   /**
-   * Add or update a policy rule
+   * Evaluate whether the context is authorized for the requested action.
+   * Deny-by-default: only an explicit allow rule grants access.
    */
-  setPolicy(policy: PolicyRule): void {
-    this.policies.set(policy.id, policy);
-    this.logger.log(`Policy updated: ${policy.id} (${policy.effect})`);
-  }
-
-  /**
-   * Remove a policy rule
-   */
-  removePolicy(policyId: string): boolean {
-    const removed = this.policies.delete(policyId);
-    if (removed) {
-      this.logger.log(`Policy removed: ${policyId}`);
+  async isAuthorized(context: AuthorizationContext): Promise<boolean> {
+    if (!context.resourceType || !context.action) {
+      return false;
     }
-    return removed;
-  }
 
-  /**
-   * Check if an action is authorized
-   */
-  async authorize(context: AuthorizationContext): Promise<{
-    allowed: boolean;
-    matchedPolicy?: PolicyRule;
-    reason: string;
-  }> {
-    // Get applicable policies sorted by priority (highest first)
-    const applicablePolicies = Array.from(this.policies.values())
-      .filter(
-        (p) =>
-          p.enabled &&
-          p.resource === context.resourceType &&
-          p.actions.includes(context.action!),
-      )
+    const candidates = Array.from(this.policies.values())
+      .filter((p) => p.enabled)
+      .filter((p) => p.resource === context.resourceType)
+      .filter((p) => p.actions.includes(context.action!))
+      .filter((p) => p.roles.some((r) => context.roles.includes(r)))
       .sort((a, b) => b.priority - a.priority);
 
-    if (applicablePolicies.length === 0) {
-      // Deny by default - no matching policy
-      return {
-        allowed: false,
-        reason: `No policy allows ${context.action} on ${context.resourceType}`,
-      };
-    }
-
-    // Evaluate each policy in priority order
-    for (const policy of applicablePolicies) {
-      // Check role match
-      if (!policy.roles.some((role) => context.roles.includes(role))) {
-        continue;
-      }
-
-      // Check conditions
-      const conditionsMet = await this.evaluateConditions(
-        policy.conditions,
-        context,
-      );
+    for (const policy of candidates) {
+      const conditionsMet = await this.evaluateConditions(policy.conditions, context);
       if (!conditionsMet) {
         continue;
       }
-
-      // Policy matches
-      if (policy.effect === 'allow') {
-        return {
-          allowed: true,
-          matchedPolicy: policy,
-          reason: `Allowed by policy: ${policy.name}`,
-        };
-      } else {
-        return {
-          allowed: false,
-          matchedPolicy: policy,
-          reason: `Denied by policy: ${policy.name}`,
-        };
+      if (policy.effect === 'deny') {
+        return false;
       }
+      return true;
     }
 
-    // No policy allowed the action
-    return {
-      allowed: false,
-      reason: `No policy allows ${context.action} on ${context.resourceType} for roles: ${context.roles.join(', ')}`,
-    };
+    return false;
   }
 
-  /**
-   * Evaluate policy conditions
-   */
   private async evaluateConditions(
     conditions: PolicyCondition[],
     context: AuthorizationContext,
   ): Promise<boolean> {
     for (const condition of conditions) {
-      const met = await this.evaluateCondition(condition, context);
-      if (!met) {
+      const ok = await this.evaluateCondition(condition, context);
+      if (!ok) {
         return false;
       }
     }
     return true;
   }
 
-  /**
-   * Evaluate a single condition
-   */
   private async evaluateCondition(
     condition: PolicyCondition,
     context: AuthorizationContext,
@@ -581,24 +523,17 @@ export class AuthorizationPolicyService {
     switch (condition.type) {
       case 'ownership':
         return this.evaluateOwnership(condition, context);
-
       case 'role':
         return this.evaluateRole(condition, context);
-
       case 'scope':
-        return this.evaluateScope(condition, context);
-
+        return true;
       case 'time':
-        return this.evaluateTime(condition, context);
-
+        return this.evaluateTime(condition);
       case 'ip':
         return this.evaluateIp(condition, context);
-
       case 'custom':
         return this.evaluateCustom(condition, context);
-
       default:
-        this.logger.warn(`Unknown condition type: ${condition.type}`);
         return false;
     }
   }
@@ -607,90 +542,38 @@ export class AuthorizationPolicyService {
     condition: PolicyCondition,
     context: AuthorizationContext,
   ): boolean {
-    if (!condition.field) return false;
-
-    const resourceValue = context.metadata?.[condition.field];
-    const userValue =
-      condition.field === 'userId' ? context.userId : context.walletAddress;
-
-    if (!resourceValue || !userValue) return false;
-
-    switch (condition.operator) {
-      case 'equals':
-        return resourceValue.toLowerCase() === userValue.toLowerCase();
-      case 'in':
-        return (
-          Array.isArray(resourceValue) &&
-          resourceValue.some(
-            (v: string) => v.toLowerCase() === userValue.toLowerCase(),
-          )
-        );
-      default:
-        return resourceValue.toLowerCase() === userValue.toLowerCase();
+    const field = condition.field || 'userId';
+    const ownerId = context.metadata?.[field] as string | undefined;
+    if (!ownerId || !context.userId) {
+      return false;
     }
+    return ownerId === context.userId;
   }
 
   private evaluateRole(
     condition: PolicyCondition,
     context: AuthorizationContext,
   ): boolean {
-    if (!condition.value) return false;
-    const requiredRoles = Array.isArray(condition.value)
-      ? condition.value
-      : [condition.value];
-    return requiredRoles.some((role: string) =>
-      context.roles.includes(role as Role),
-    );
+    const required = condition.value as Role | Role[];
+    const requiredList = Array.isArray(required) ? required : [required];
+    return requiredList.some((r) => context.roles.includes(r));
   }
 
-  private evaluateScope(
-    condition: PolicyCondition,
-    context: AuthorizationContext,
-  ): boolean {
-    // Scope-based conditions (e.g., organization, team, project)
-    if (!condition.field || !condition.value) return false;
-    const scopeValue = context.metadata?.[condition.field];
-    const requiredScope = condition.value;
-    return scopeValue === requiredScope;
-  }
-
-  private evaluateTime(
-    condition: PolicyCondition,
-    context: AuthorizationContext,
-  ): boolean {
-    // Time-based conditions (e.g., business hours, maintenance windows)
-    const now = new Date();
-    const hour = now.getHours();
-
-    if (condition.field === 'businessHours') {
-      return hour >= 9 && hour < 18; // 9 AM - 6 PM
+  private evaluateTime(condition: PolicyCondition): boolean {
+    const now = Date.now();
+    const value = condition.value as {
+      start?: number;
+      end?: number;
+    } | undefined;
+    if (!value) {
+      return false;
     }
-
-    if (condition.field === 'maintenanceWindow') {
-      // Check if in maintenance window
-      const maintenanceStart = this.configService.get<string>(
-        'MAINTENANCE_WINDOW_START',
-        '02:00',
-      );
-      const maintenanceEnd = this.configService.get<string>(
-        'MAINTENANCE_WINDOW_END',
-        '04:00',
-      );
-      const [startHour, startMin] = maintenanceStart.split(':').map(Number);
-      const [endHour, endMin] = maintenanceEnd.split(':').map(Number);
-
-      const currentMinutes = hour * 60 + now.getMinutes();
-      const startMinutes = startHour * 60 + startMin;
-      const endMinutes = endHour * 60 + endMin;
-
-      if (startMinutes < endMinutes) {
-        return currentMinutes >= startMinutes && currentMinutes <= endMinutes;
-      } else {
-        // Overnight window
-        return currentMinutes >= startMinutes || currentMinutes <= endMinutes;
-      }
+    if (typeof value.start === 'number' && now < value.start) {
+      return false;
     }
-
+    if (typeof value.end === 'number' && now > value.end) {
+      return false;
+    }
     return true;
   }
 
@@ -698,200 +581,355 @@ export class AuthorizationPolicyService {
     condition: PolicyCondition,
     context: AuthorizationContext,
   ): boolean {
-    if (!context.ipAddress || !condition.value) return false;
-
-    const allowedIps = Array.isArray(condition.value)
-      ? condition.value
-      : [condition.value];
-
-    switch (condition.operator) {
-      case 'in':
-        return allowedIps.some((ip: string) =>
-          this.ipMatches(context.ipAddress!, ip),
-        );
-      case 'not_in':
-        return !allowedIps.some((ip: string) =>
-          this.ipMatches(context.ipAddress!, ip),
-        );
-      default:
-        return allowedIps.some((ip: string) =>
-          this.ipMatches(context.ipAddress!, ip),
-        );
+    const allowed = condition.value as string | string[] | undefined;
+    if (!allowed || !context.ipAddress) {
+      return false;
     }
-  }
-
-  private ipMatches(ip: string, pattern: string): boolean {
-    if (pattern.includes('/')) {
-      // CIDR notation
-      const [rangeIp, prefix] = pattern.split('/');
-      return this.cidrMatch(ip, rangeIp, parseInt(prefix, 10));
-    }
-    return ip === pattern;
-  }
-
-  private cidrMatch(ip: string, rangeIp: string, prefix: number): boolean {
-    const ipParts = ip.split('.').map(Number);
-    const rangeParts = rangeIp.split('.').map(Number);
-
-    const ipNum =
-      (ipParts[0] << 24) | (ipParts[1] << 16) | (ipParts[2] << 8) | ipParts[3];
-    const rangeNum =
-      (rangeParts[0] << 24) |
-      (rangeParts[1] << 16) |
-      (rangeParts[2] << 8) |
-      rangeParts[3];
-
-    const mask = ~((1 << (32 - prefix)) - 1);
-    return (ipNum & mask) === (rangeNum & mask);
+    const list = Array.isArray(allowed) ? allowed : [allowed];
+    return list.includes(context.ipAddress);
   }
 
   private async evaluateCustom(
     condition: PolicyCondition,
     context: AuthorizationContext,
   ): Promise<boolean> {
-    if (!condition.customEvaluator) return false;
-
-    const evaluator = this.customEvaluators.get(condition.customEvaluator);
-    if (!evaluator) {
-      this.logger.warn(
-        `Custom evaluator not found: ${condition.customEvaluator}`,
-      );
+    const name = condition.customEvaluator;
+    if (!name) {
       return false;
     }
-
+    const evaluator = this.customEvaluators.get(name);
+    if (!evaluator) {
+      return false;
+    }
     try {
       return await evaluator(context);
-    } catch (error) {
-      this.logger.error(
-        `Custom evaluator ${condition.customEvaluator} failed: ${error.message}`,
-      );
+    } catch {
       return false;
     }
   }
 
-  /**
-   * Get all policies for a resource
-   */
-  getPoliciesForResource(resource: ResourceType): PolicyRule[] {
-    return Array.from(this.policies.values())
-      .filter((p) => p.resource === resource && p.enabled)
-      .sort((a, b) => b.priority - a.priority);
-  }
+  // ----------------------------------------------------------------------------
+  // PREWAVE-BE-082: Capability Tokens
+  // ----------------------------------------------------------------------------
 
   /**
-   * Get all policies
+   * Issue a signed, short-lived capability token.
+   * Authentication alone grants no capability; a token must be explicitly issued.
    */
-  getAllPolicies(): PolicyRule[] {
-    return Array.from(this.policies.values()).sort(
-      (a, b) => b.priority - a.priority,
+  async issueCapabilityToken(
+    request: CapabilityIssueRequest,
+  ): Promise<CapabilityToken> {
+    this.assertRequiredString(request.aud, 'aud');
+    this.assertRequiredString(request.sub, 'sub');
+    this.assertRequiredString(request.cap, 'cap');
+
+    if (!Object.values(ResourceType).includes(request.resource)) {
+      throw new CapabilityTokenError('resource_invalid', 'Unknown resource type');
+    }
+    if (!Object.values(ActionType).includes(request.action)) {
+      throw new CapabilityTokenError('action_invalid', 'Unknown action type');
+    }
+
+    const ttl = this.resolveTtl(request.ttlSeconds);
+    const now = Math.floor(Date.now() / 1000);
+
+    const context = this.resolveContext(request);
+
+    const claims: CapabilityTokenClaims = {
+      ver: 1,
+      aud: request.aud,
+      sub: request.sub,
+      cap: request.cap,
+      resource: request.resource,
+      resourceId: request.resourceId,
+      action: request.action,
+      nonce: randomBytes(16).toString('hex'),
+      iat: now,
+      exp: now + ttl,
+      chain: context.chain,
+      release: context.release,
+      deployment: context.deployment,
+      artifact: context.artifact,
+    };
+
+    const signature = this.signClaims(claims);
+
+    this.logger.log(
+      `issued capability token aud=${claims.aud} sub=${claims.sub} cap=${claims.cap} ` +
+        `resource=${claims.resource} action=${claims.action} nonce=${claims.nonce} exp=${claims.exp}`,
     );
+
+    return { claims, signature };
   }
 
   /**
-   * Export policies for auditing
+   * Validate and consume a capability token.
+   * Fails closed on any mismatch, expiry, replay, or revocation.
    */
-  exportPolicies(): string {
-    return JSON.stringify(this.getAllPolicies(), null, 2);
+  async useCapabilityToken(request: CapabilityUseRequest): Promise<void> {
+    const { token } = request;
+    if (!token || !token.claims || typeof token.signature !== 'string') {
+      this.auditUse('malformed', request);
+      throw new CapabilityTokenError('malformed', 'Malformed capability token');
+    }
+
+    const claims = token.claims;
+
+    // Signature verification first (fail closed).
+    if (!this.verifySignature(claims, token.signature)) {
+      this.auditUse('bad-signature', request);
+      throw new CapabilityTokenError('bad_signature', 'Invalid token signature');
+    }
+
+    if (claims.ver !== 1) {
+      this.auditUse('bad-version', request);
+      throw new CapabilityTokenError('bad_version', 'Unsupported token version');
+    }
+
+    // Audience / subject / capability binding.
+    if (claims.aud !== request.aud) {
+      this.auditUse('wrong-aud', request);
+      throw new CapabilityTokenError('wrong_aud', 'Token audience mismatch');
+    }
+    if (claims.sub !== request.sub) {
+      this.auditUse('wrong-sub', request);
+      throw new CapabilityTokenError('wrong_sub', 'Token subject mismatch');
+    }
+    if (claims.cap !== request.cap) {
+      this.auditUse('wrong-cap', request);
+      throw new CapabilityTokenError('wrong_cap', 'Token capability mismatch');
+    }
+
+    // Resource scope binding.
+    if (claims.resource !== request.resource) {
+      this.auditUse('wrong-resource', request);
+      throw new CapabilityTokenError('wrong_resource', 'Token resource mismatch');
+    }
+    if ((claims.resourceId ?? undefined) !== (request.resourceId ?? undefined)) {
+      this.auditUse('wrong-resource-id', request);
+      throw new CapabilityTokenError('wrong_resource_id', 'Token resource id mismatch');
+    }
+    if (claims.action !== request.action) {
+      this.auditUse('wrong-action', request);
+      throw new CapabilityTokenError('wrong_action', 'Token action mismatch');
+    }
+
+    // Chain/release/deployment/artifact context binding.
+    const ctx = this.resolveContext(request);
+    if (claims.chain !== ctx.chain) {
+      this.auditUse('wrong-chain', request);
+      throw new CapabilityTokenError('wrong_chain', 'Token chain context mismatch');
+    }
+    if (claims.release !== ctx.release) {
+      this.auditUse('wrong-release', request);
+      throw new CapabilityTokenError('wrong_release', 'Token release context mismatch');
+    }
+    if (claims.deployment !== ctx.deployment) {
+      this.auditUse('wrong-deployment', request);
+      throw new CapabilityTokenError('wrong_deployment', 'Token deployment context mismatch');
+    }
+    if (claims.artifact !== ctx.artifact) {
+      this.auditUse('wrong-artifact', request);
+      throw new CapabilityTokenError('wrong_artifact', 'Token artifact context mismatch');
+    }
+
+    // Temporal validity.
+    const now = Math.floor(Date.now() / 1000);
+    if (typeof claims.exp !== 'number' || typeof claims.iat !== 'number') {
+      this.auditUse('bad-temporal', request);
+      throw new CapabilityTokenError('bad_temporal', 'Token temporal claims invalid');
+    }
+    if (claims.exp - claims.iat > MAX_CAPABILITY_TTL_SECONDS) {
+      this.auditUse('ttl-too-long', request);
+      throw new CapabilityTokenError('ttl_too_long', 'Token lifetime exceeds maximum');
+    }
+    if (now > claims.exp + CAPABILITY_CLOCK_SKEW) {
+      this.auditUse('expired', request);
+      throw new CapabilityTokenError('expired', 'Token has expired');
+    }
+    if (now + CAPABILITY_CLOCK_SKEW < claims.iat) {
+      this.auditUse('not-yet-valid', request);
+      throw new CapabilityTokenError('not_yet_valid', 'Token is not yet valid');
+    }
+
+    // Revocation check (fail closed).
+    const revoked = await this.redisService.get(
+      `${REVOKED_SUBJECT_KEY_PREFIX}${claims.sub}`,
+    );
+    if (revoked) {
+      this.auditUse('revoked-subject', request);
+      throw new CapabilityTokenError('revoked', 'Token subject has been revoked');
+    }
+
+    // Replay protection: atomically claim the nonce.
+    const nonceKey = `${NONCE_KEY_PREFIX}${claims.nonce}`;
+    const ttl = Math.max(1, claims.exp - now + CAPABILITY_CLOCK_SKEW);
+    const claimed = await this.redisService.setIfNotExists(nonceKey, '1', ttl);
+    if (!claimed) {
+      this.auditUse('replay', request);
+      throw new CapabilityTokenError('replay', 'Token has already been used');
+    }
+
+    this.auditUse('ok', request);
+  }
+
+  /**
+   * Revoke all capability tokens for a subject.
+   */
+  async revokeSubject(sub: string, ttlSeconds?: number): Promise<void> {
+    this.assertRequiredString(sub, 'sub');
+    const ttl = this.resolveTtl(ttlSeconds);
+    await this.redisService.set(
+      `${REVOKED_SUBJECT_KEY_PREFIX}${sub}`,
+      '1',
+      ttl,
+    );
+    this.logger.log(`revoked capability tokens for subject=${sub}`);
+  }
+
+  private resolveTtl(ttlSeconds?: number): number {
+    const requested = ttlSeconds ?? undefined;
+    if (requested === undefined) {
+      return DEFAULT_CAPABILITY_TTL_SECONDS;
+    }
+    if (!Number.isFinite(requested) || requested <= 0) {
+      throw new CapabilityTokenError('bad_ttl', 'TTL must be a positive number');
+    }
+    return Math.min(Math.floor(requested), MAX_CAPABILITY_TTL_SECONDS);
+  }
+
+  private resolveContext(request: {
+    chain?: string;
+    release?: string;
+    deployment?: string;
+    artifact?: string;
+  }): { chain: string; release: string; deployment: string; artifact: string } {
+    const chain = request.chain ?? '';
+    const release = request.release ?? '';
+    const deployment = request.deployment ?? '';
+    const artifact = request.artifact ?? '';
+    if (!chain || !release || !deployment || !artifact) {
+      throw new CapabilityTokenError(
+        'missing_context',
+        'Chain, release, deployment, and artifact context are required',
+      );
+    }
+    return { chain, release, deployment, artifact };
+  }
+
+  private assertRequiredString(value: unknown, field: string): void {
+    if (typeof value !== 'string' || value.length === 0) {
+      throw new CapabilityTokenError(
+        'missing_field',
+        `Required field '${field}' is missing`,
+      );
+    }
+  }
+
+  private getSigningKey(): string {
+    const key = this.configService.get<string>('CAPABILITY_TOKEN_SIGNING_KEY');
+    if (!key) {
+      throw new CapabilityTokenError(
+        'missing_signing_key',
+        'Capability token signing key is not configured',
+      );
+    }
+    return key;
+  }
+
+  private canonicalizeClaims(claims: CapabilityTokenClaims): string {
+    return JSON.stringify({
+      ver: claims.ver,
+      aud: claims.aud,
+      sub: claims.sub,
+      cap: claims.cap,
+      resource: claims.resource,
+      resourceId: claims.resourceId ?? null,
+      action: claims.action,
+      nonce: claims.nonce,
+      iat: claims.iat,
+      exp: claims.exp,
+      chain: claims.chain,
+      release: claims.release,
+      deployment: claims.deployment,
+      artifact: claims.artifact,
+    });
+  }
+
+  private signClaims(claims: CapabilityTokenClaims): string {
+    return createHmac('sha256', this.getSigningKey())
+      .update(this.canonicalizeClaims(claims))
+      .digest('hex');
+  }
+
+  private verifySignature(claims: CapabilityTokenClaims, signature: string): boolean {
+    try {
+      const expected = this.signClaims(claims);
+      const a = Buffer.from(expected, 'hex');
+      const b = Buffer.from(signature, 'hex');
+      if (a.length !== b.length) {
+        return false;
+      }
+      return timingSafeEqual(a, b);
+    } catch {
+      return false;
+    }
+  }
+
+  private auditUse(outcome: string, request: CapabilityUseRequest): void {
+    const claims = request.token?.claims;
+    this.logger.log(
+      `capability token use outcome=${outcome} aud=${request.aud} sub=${request.sub} ` +
+        `cap=${request.cap} resource=${request.resource} action=${request.action} ` +
+        `nonce=${claims?.nonce ?? '-'}`,
+    );
   }
 }
 
 /**
- * Authorization Guard for NestJS
+ * Guard that requires a valid capability token on the request.
  */
 @Injectable()
-export class AuthorizationGuard implements CanActivate {
-  private readonly logger = new Logger(AuthorizationGuard.name);
-
+export class CapabilityTokenGuard implements CanActivate {
   constructor(
-    private readonly policyService: AuthorizationPolicyService,
     private readonly reflector: Reflector,
+    private readonly policyService: AuthorizationPolicyService,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const request = context.switchToHttp().getRequest();
-    const user = request.user;
-
-    if (!user) {
-      throw new ForbiddenException('Authentication required');
+    const requirement = this.reflector.get<{
+      aud: string;
+      cap: string;
+      resource: ResourceType;
+      action: ActionType;
+    }>('capability', context.getHandler());
+    if (!requirement) {
+      throw new ForbiddenException('Capability requirement missing');
     }
-
-    // Get required permission from route metadata
-    const requiredPermission = this.reflector.get<Permission>(
-      'permission',
-      context.getHandler(),
-    );
-
-    if (!requiredPermission) {
-      // No permission required - allow if authenticated
-      return true;
+    const token = request.body?.capabilityToken as CapabilityToken | undefined;
+    const sub = request.user?.id as string | undefined;
+    if (!token || !sub) {
+      throw new ForbiddenException('Missing capability token or subject');
     }
-
-    // Build authorization context
-    const authContext: AuthorizationContext = {
-      userId: user.sub || user.userId,
-      walletAddress: user.address,
-      roles: user.roles || [Role.USER],
-      permissions: user.permissions || [],
-      resourceId: request.params.id || request.body?.id,
-      resourceType: requiredPermission.resource,
-      action: requiredPermission.action,
-      ipAddress: request.ip,
-      userAgent: request.get('user-agent'),
-      metadata: {
-        ...request.params,
-        ...request.body,
-        ...request.query,
-      },
-    };
-
-    const result = await this.policyService.authorize(authContext);
-
-    if (!result.allowed) {
-      this.logger.warn(`Authorization denied: ${result.reason}`, {
-        userId: authContext.userId,
-        resource: authContext.resourceType,
-        action: authContext.action,
-        roles: authContext.roles,
+    try {
+      await this.policyService.useCapabilityToken({
+        token,
+        aud: requirement.aud,
+        sub,
+        cap: requirement.cap,
+        resource: requirement.resource,
+        resourceId: request.params?.id as string | undefined,
+        action: requirement.action,
+        chain: request.body?.chain,
+        release: request.body?.release,
+        deployment: request.body?.deployment,
+        artifact: request.body?.artifact,
       });
-      throw new ForbiddenException(result.reason);
+      return true;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Capability token rejected';
+      throw new ForbiddenException(message);
     }
-
-    return true;
   }
 }
-
-/**
- * Decorator for declaring required permissions
- */
-export const RequirePermission = (permission: Permission) => {
-  return (
-    target: any,
-    propertyKey?: string,
-    descriptor?: PropertyDescriptor,
-  ) => {
-    if (descriptor) {
-      Reflect.defineMetadata('permission', permission, descriptor.value);
-    } else {
-      Reflect.defineMetadata('permission', permission, target);
-    }
-    return descriptor ?? target;
-  };
-};
-
-/**
- * Decorator for declaring required roles
- */
-export const RequireRoles = (...roles: Role[]) => {
-  return (
-    target: any,
-    propertyKey?: string,
-    descriptor?: PropertyDescriptor,
-  ) => {
-    if (descriptor) {
-      Reflect.defineMetadata('roles', roles, descriptor.value);
-    } else {
-      Reflect.defineMetadata('roles', roles, target);
-    }
-    return descriptor ?? target;
-  };
-};

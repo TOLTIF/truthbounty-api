@@ -11,6 +11,8 @@ import { WeightedVoteResolutionService } from './weighted-vote-resolution.servic
 import { SybilResistanceModule } from '../sybil-resistance/sybil-resistance.module';
 import { StartupValidationService } from './startup-validation.service';
 import { DeterministicRpcFailoverService } from './deterministic-rpc-failover.service';
+import { ReadinessService } from './readiness.service';
+import { DependencyProvenanceService } from './dependency-provenance.service';
 
 @Module({
   imports: [
@@ -20,6 +22,8 @@ import { DeterministicRpcFailoverService } from './deterministic-rpc-failover.se
   providers: [
     BlockchainIndexerService,
     BlockchainStateService,
+    ReadinessService,
+    DependencyProvenanceService,
     ReorgDetectorService,
     ReconciliationService,
     EventIndexingService,
@@ -30,6 +34,8 @@ import { DeterministicRpcFailoverService } from './deterministic-rpc-failover.se
   exports: [
     BlockchainIndexerService,
     BlockchainStateService,
+    ReadinessService,
+    DependencyProvenanceService,
     ReorgDetectorService,
     ReconciliationService,
     EventIndexingService,

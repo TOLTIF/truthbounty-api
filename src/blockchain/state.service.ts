@@ -9,7 +9,18 @@ import {
   StateMemoryStats,
   IndexerHealthSnapshot,
   IndexerHealthStatus,
+  ReadinessSnapshot,
+  ReadinessStatus,
+  DependencyProvenance,
 } from './types';
+
+/**
+ * Maximum age of a successful observation before readiness is withdrawn.
+ * A stale last-success cannot report healthy.
+ */
+const DEFAULT_STANE_THRESHOLD_MS = 60_000;
+
+export const READINESS_STATUS_PREFIX = 'readiness';
 
 @Injectable()
 export class BlockchainStateService {
@@ -43,6 +54,16 @@ export class BlockchainStateService {
   private readonly maxDeadLetters: number;
   private readonly rpcFailureTimestamps: number[] = [];
   private readonly runbookUrl: string;
+
+  // Readiness / provenance tracking.
+  private readonly staleThresholdMs: number;
+  private lastSuccessAt: Date | null = null;
+  private lastSuccessObservationId: string | null = null;
+  private startedAt: Date = new Date();
+  private startupComplete = false;
+  private readonessProvenance: Map<string, DependencyProvenance> =
+    new Map();
+  private readinessReasons: string[] = [];
 
   constructor(@Optional() private configService?: ConfigService) {
     this.maxBlocksInMemory =
@@ -96,13 +117,24 @@ export class BlockchainStateService {
         'https://github.com/DigiNodes/truthbounty-api/blob/main/docs/indexer-runbook.md',
       ) ??
       'https://github.com/DigiNodes/truthbounty-api/blob/main/docs/indexer-runbook.md';
+    this.staleThresholdMs =
+      this.configService?.get<number>(
+        'blockchain.readinessStaleThresholdMs',
+        DEFAULT_STANE_THRESHOLD_MS,
+      ) ?? DEFAULT_STANE_THRESHOLD_MS;
+    if (!Number.isFinite(this.staleThresholdMs) || this.staleThresholdMs <= 0) {
+      throw new Error(
+        'blockchain.readinessStaleThresholdMs must be a positive number',
+      );
+    }
 
     this.logger.log(
       `Memory limits — blocks: ${this.maxBlocksInMemory}, ` +
         `events: ${this.maxEventsInMemory}, ` +
         `reorg history: ${this.maxReorgHistoryEntries}, ` +
         `indexer lag threshold: ${this.indexerLagThresholdBlocks} blocks, ` +
-        `finality lag threshold: ${this.finalityLagThresholdBlocks} blocks`,
+        `finality lag threshold: ${this.finalityLagThresholdBlocks} blocks, ` +
+        `readiness stale threshold: ${this.staleThresholdMs}ms`,
     );
   }
 
@@ -257,6 +289,7 @@ export class BlockchainStateService {
    */
   async setObservedHead(blockNumber: number): Promise<void> {
     this.chainState.observedHeadBlock = blockNumber;
+    this.chainState.lastObservedAt = new Date().toISOString();
     this.refreshProjectionLag();
   }
 
@@ -273,6 +306,7 @@ export class BlockchainStateService {
    */
   async setFinalizedBlock(blockNumber: number): Promise<void> {
     this.chainState.finalizedBlock = blockNumber;
+    this.chainState.lastFinalizedAt = new Date().toISOString();
     this.refreshProjectionLag();
   }
 
@@ -282,6 +316,7 @@ export class BlockchainStateService {
    */
   async setProjectionHead(blockNumber: number): Promise<void> {
     this.chainState.projectionHeadBlock = blockNumber;
+    this.chainState.lastProjectionAt = new Date().toISOString();
   }
 
   /**
@@ -349,173 +384,188 @@ export class BlockchainStateService {
 
   getIndexerLag(): number {
     const lag =
-      (this.chainState.finalizedBlock ?? 0) -
-      (this.chainState.projectionHeadBlock ?? 0);
+      (this.chainState.observedHeadBlock ?? 0) -
+      (this.chainState.lastProcessedBlock ?? 0);
     return lag > 0 ? lag : 0;
-  }
-
-  getFinalityLag(): number {
-    return this.getProjectionLag();
-  }
-
-  /**
-   * Derive the sanitized indexer health snapshot for health/metrics consumers.
-   * Fails closed on incompatible state (missing cursors => unhealthy).
-   */
-  async getIndexerHealth(): Promise<IndexerHealthSnapshot> {
-    const projectionLag = this.getProjectionLag();
-    const indexerLagBlocks = this.getIndexerLag();
-    const finalityLagBlocks = this.getFinalityLag();
-    const rpcFailuresInWindow = this.getRpcFailuresInWindow();
-
-    let status: IndexerHealthStatus = 'healthy';
-    if (
-      indexerLagBlocks > this.indexerLagThresholdBlocks ||
-      finalityLagBlocks > this.finalityLagThresholdBlocks ||
-      rpcFailuresInWindow >= this.rpcFailureLimit ||
-      (this.chainState.deadLetterCount ?? 0) > this.maxDeadLetters
-    ) {
-      status = 'degraded';
-    }
-    if (
-      this.chainState.observedHeadBlock == null ||
-      this.chainState.finalizedBlock == null ||
-      this.chainState.projectionHeadBlock == null ||
-      this.chainState.rpcFailureCount == null ||
-      this.chainState.finalizedBlock > this.chainState.observedHeadBlock
-    ) {
-      status = 'unhealthy';
-    }
-
-    return {
-      status,
-      timestamp: new Date().toISOString(),
-      observedHeadBlock: this.chainState.observedHeadBlock ?? 0,
-      safeBlock: this.chainState.safeBlock ?? 0,
-      finalizedBlock: this.chainState.finalizedBlock ?? 0,
-      projectionHeadBlock: this.chainState.projectionHeadBlock ?? 0,
-      indexerLagBlocks,
-      finalityLagBlocks,
-      projectionLag,
-      rpcFailureCount: this.chainState.rpcFailureCount ?? 0,
-      replayCount: this.chainState.replayCount ?? 0,
-      deadLetterCount: this.chainState.deadLetterCount ?? 0,
-      alertThresholds: {
-        indexerLagBlocks: this.indexerLagThresholdBlocks,
-        finalityLagBlocks: this.finalityLagThresholdBlocks,
-        projectionLagBlocks: this.finalityLagThresholdBlocks,
-        rpcFailureRateWindow: this.rpcFailureWindow,
-        maxDeadLetters: this.maxDeadLetters,
-      },
-      runbookUrl: this.runbookUrl,
-    };
   }
 
   private refreshProjectionLag(): void {
     this.chainState.projectionLag = this.getProjectionLag();
   }
 
-  async deleteEvents(eventIds: string[]): Promise<void> {
-    for (const id of eventIds) {
-      const event = this.events.get(id);
-      if (event) {
-        if (event.status === 'pending') {
-          this.chainState.pendingEventCount--;
-        } else if (event.status === 'orphaned') {
-          this.chainState.orphanedEventCount--;
-        }
-        this.events.delete(id);
-      }
-    }
+  /**
+   * Record a successful observation. Readiness requires a fresh successful
+   * observation; this is the only way to clear a stale or degraded state.
+   */
+  async recordSuccessfulObservation(observationId?: string): Promise<void> {
+    this.lastSuccessAt = new Date();
+    this.lastSuccessObservationId = observationId ?? null;
   }
 
-  async clearAllState(): Promise<void> {
-    this.blocks.clear();
-    this.events.clear();
-    this.reorgHistory = [];
-    this.rpcFailureTimestamps.length = 0;
-    this.chainState = {
-      lastProcessedBlock: 0,
-      lastCanonicalHash: '',
-      confirmedDepth: 0,
-      pendingEventCount: 0,
-      orphanedEventCount: 0,
-      rpcFailureCount: 0,
-      replayCount: 0,
-      deadLetterCount: 0,
-      lastRpcErrorAt: null,
-      projectionLag: 0,
+  /**
+   * Mark startup as complete. Until this is called, readiness is withheld.
+   */
+  async markStartupComplete(): Promise<void> {
+    this.startupComplete = true;
+  }
+
+  /**
+   * Upsert provenance for a single dependency (rpc, redis, db, indexer, ipfs).
+   */
+  async setDependencyProvenance(
+    name: string,
+    provenance: DependencyProvenance,
+  ): Promise<void> {
+    this.readonessProvenance.set(name, { ...provenance });
+  }
+
+  /**
+   * Record a dependency failure. A required dependency failure removes readiness.
+   */
+  async recordDependencyFailure(
+    name: string,
+    reason: string,
+    required = true,
+  ): Promise<void> {
+    const existing = this.readonessProvenance.get(name);
+    this.readonessProvenance.set(name, {
+      name,
+      ok: false,
+      required,
+      observedAt: new Date().toISOString(),
+      lastSuccessAt: existing?.lastSuccessAt ?? null,
+      reason,
+      chainId: existing?.chainId ?? null,
+      releaseId: existing?.releaseId ?? null,
+      deploymentBlock: existing?.deploymentBlock ?? null,
+      artifactChecksum: existing?.artifactChecksum ?? null,
+    });
+  }
+
+  /**
+   * Compute the current readiness snapshot. Fails closed on stale, missing, or
+   * failed required dependencies. Public status is sanitized (reasons are
+   * codes, not internal details).
+   */
+  getReadinessSnapshot(): ReadinessSnapshot {
+    const now = Date.now();
+    const reasons: string[] = [];
+
+    if (!this.startupComplete) {
+      reasons.push('startup_incomplete');
+    }
+
+    const lastSuccessAt = this.lastSuccessAt;
+    if (!lastSuccessAt) {
+      reasons.push('no_successful_observation');
+    } else if (now - lastSuccessAt.getTime() > this.staleThresholdMs) {
+      reasons.push('stale_success');
+    }
+
+    const projectionLag = this.getProjectionLag();
+    if (projectionLag > this.finalityLagThresholdBlocks) {
+      reasons.push('rpc_lag');
+    }
+
+    const indexerLag = this.getIndexerLag();
+    if (indexerLag > this.indexerLagThresholdBlocks) {
+      reasons.push('indexer_gap');
+    }
+
+    if (this.getRpcFailuresInWindow() > this.rpcFailureLimit) {
+      reasons.push('rpc_failure_rate');
+    }
+
+    if ((this.chainState.deadLetterCount ?? 0) > this.maxDeadLetters) {
+      reasons.push('dead_letter_overflow');
+    }
+
+    const provenance: DependencyProvenance[] = [];
+    this.readonessProvenance.forEach((p) => {
+      provenance.push({ ...p });
+      if (p.required && !p.ok) {
+        reasons.push(`dependency_failed:${p.name}`);
+      }
+    });
+
+    this.readinessReasons = reasons;
+
+    let status: ReadinessStatus;
+    if (!this.startupComplete) {
+      status = 'starting';
+    } else if (reasons.length > 0) {
+      status = 'degraded';
+    } else {
+      status = 'healthy';
+    }
+
+    return {
+      status,
+      observedAt: new Date(now).toISOString(),
+      lastSuccessAt: lastSuccessAt
+        ? lastSuccessAt.toISOString()
+        : null,
+      chainHead: this.chainState.observedHeadBlock ?? null,
+      finalizedBlock: this.chainState.finalizedBlock ?? null,
+      projectionLag,
+      releaseId: null,
+      reasons,
+      provenance,
     };
   }
 
-  async getMemoryStats(): Promise<StateMemoryStats> {
-    let confirmed = 0;
-    let pending = 0;
-    let orphaned = 0;
-    this.events.forEach((event) => {
-      if (event.status === 'confirmed') confirmed++;
-      else if (event.status === 'pending') pending++;
-      else if (event.status === 'orphaned') orphaned++;
-    });
-
+  /**
+   * Sanitized public status — no internal details or provenance leaked.
+   */
+  getPublicStatus(): { status: ReadinessStatus; reasons: string[] } {
+    const snapshot = this.getReadinessSnapshot();
     return {
-      currentBlockCount: this.blocks.size,
-      currentEventCount: this.events.size,
-      currentReorgHistoryCount: this.reorgHistory.length,
+      status: snapshot.status,
+      reasons: snapshot.reasons.map((r) =>
+        r.startsWith('dependency_failed') ? 'dependency_failed' : r,
+      ),
+    };
+  }
+
+  getHealthSnapshot(): IndexerHealthSnapshot {
+    const readiness = this.getReadinessSnapshot();
+    const status: IndexerHealthStatus =
+      readiness.status === 'healthy' ? 'healthy' : 'degraded';
+    return {
+      status,
+      readiness,
+      runbookUrl: this.runbookUrl,
+    };
+  }
+
+  getMemoryStats(): StateMemoryStats {
+    return {
+      blocksInMemory: this.blocks.size,
+      eventsInMemory: this.events.size,
+      reorgHistoryEntries: this.reorgHistory.length,
       maxBlocksInMemory: this.maxBlocksInMemory,
       maxEventsInMemory: this.maxEventsInMemory,
       maxReorgHistoryEntries: this.maxReorgHistoryEntries,
-      confirmedEventCount: confirmed,
-      pendingEventCount: pending,
-      orphanedEventCount: orphaned,
     };
   }
 
   private evictOldBlocks(): void {
-    if (this.blocks.size <= this.maxBlocksInMemory) return;
-
-    const sorted: { id: string; blockNumber: number }[] = [];
-    this.blocks.forEach((block, id) => {
-      sorted.push({ id, blockNumber: block.blockNumber });
-    });
-
-    sorted.sort((a, b) => a.blockNumber - b.blockNumber);
-
-    const excess = this.blocks.size - this.maxBlocksInMemory;
-    for (let i = 0; i < excess; i++) {
-      this.blocks.delete(sorted[i].id);
+    while (this.blocks.size > this.maxBlocksInMemory) {
+      const oldestKey = this.blocks.keys().next().value;
+      if (oldestKey === undefined) {
+        break;
+      }
+      this.blocks.delete(oldestKey);
     }
-
-    this.logger.debug(`Evicted ${excess} old block(s) from memory`);
   }
 
   private evictOldEvents(): void {
-    if (this.events.size <= this.maxEventsInMemory) return;
-
-    const confirmed: { id: string; confirmedAt?: Date }[] = [];
-    this.events.forEach((event, id) => {
-      if (event.status === 'confirmed') {
-        confirmed.push({ id, confirmedAt: event.confirmedAt });
+    while (this.events.size > this.maxEventsInMemory) {
+      const oldestKey = this.events.keys().next().value;
+      if (oldestKey === undefined) {
+        break;
       }
-    });
-
-    confirmed.sort((a, b) => {
-      if (!a.confirmedAt && !b.confirmedAt) return 0;
-      if (!a.confirmedAt) return -1;
-      if (!b.confirmedAt) return 1;
-      return a.confirmedAt.getTime() - b.confirmedAt.getTime();
-    });
-
-    const excess = this.events.size - this.maxEventsInMemory;
-    const toRemove = Math.min(excess, confirmed.length);
-    for (let i = 0; i < toRemove; i++) {
-      this.events.delete(confirmed[i].id);
-    }
-
-    if (toRemove > 0) {
-      this.logger.debug(
-        `Evicted ${toRemove} old confirmed event(s) from memory`,
-      );
+      this.events.delete(oldestKey);
     }
   }
 

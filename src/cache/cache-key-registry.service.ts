@@ -26,8 +26,33 @@ export interface CacheKeyDefinition {
 
 export type CacheScope = 'global' | 'tenant' | 'wallet' | 'user' | 'chain' | 'contract';
 
+/**
+ * Closed vocabulary of invalidation events. Unknown events fail validation.
+ * Reorg and release rollover evict every projection on the affected chain/release.
+ */
+export const INVALIDATION_EVENTS = [
+  'claim.created', 'claim.updated', 'claim.deleted',
+  'evidence.added',
+  'dispute.created', 'dispute.updated', 'dispute.resolved',
+  'vote.cast',
+  'wallet.linked', 'wallet.unlinked',
+  'reputation.updated',
+  'indexer.checkpoint', 'indexer.reorg',
+  'blockchain.reorg',
+  'rewards.claimed', 'rewards.distributed',
+  'config.updated',
+  'contract.deployed',
+  'analytics.updated',
+  'release.rollover',
+] as const;
+
+export type InvalidationEvent = (typeof INVALIDATION_EVENTS)[number];
+
+/** Events that must evict all chain-scoped projections deterministically. */
+export const GLOBAL_EVICTION_EVENTS: readonly InvalidationEvent[] = ['indexer.reorg', 'blockchain.reorg', 'release.rollover'];
+
 export interface InvalidationTrigger {
-  event: string; // Event name that triggers invalidation
+  event: InvalidationEvent; // Event name that triggers invalidation
   pattern?: string; // Key pattern to invalidate (supports wildcards)
   tags?: string[]; // Tags to invalidate
   scope?: CacheScope; // Specific scope to invalidate
@@ -172,12 +197,16 @@ export class CacheKeyRegistryService implements OnModuleInit {
    * Invalidate cache entries by trigger
    */
   async invalidateByTrigger(event: string, context: Record<string, string> = {}): Promise<InvalidationResult> {
+    if (!(INVALIDATION_EVENTS as readonly string[]).includes(event)) {
+      throw new Error(`Unknown invalidation event: ${event}`);
+    }
     const triggers: InvalidationTrigger[] = [];
-    const invalidatedKeys: string[] = [];
+    const invalidatedKeys = new Set<string>();
+    const isGlobalEviction = (GLOBAL_EVICTION_EVENTS as readonly string[]).includes(event);
 
-    for (const [baseKey, def] of this.registry) {
+    for (const [baseKey, def] of [...this.registry].sort(([a], [b]) => a.localeCompare(b))) {
       for (const trigger of def.invalidationTriggers) {
-        if (trigger.event === event || trigger.event === '*') {
+        if (trigger.event === event) {
           triggers.push(trigger);
 
           let keysToInvalidate: string[] = [];
@@ -197,19 +226,26 @@ export class CacheKeyRegistryService implements OnModuleInit {
             keysToInvalidate = await this.findKeysByPattern(`${baseKey}*`);
           }
 
-          for (const key of keysToInvalidate) {
-            await this.redisService.del(key);
-            invalidatedKeys.push(key);
-          }
+          keysToInvalidate.forEach((k) => invalidatedKeys.add(k));
         }
+      }
+
+      // Reorg / release rollover: evict every chain-scoped projection, limited to the affected chain when given.
+      if (isGlobalEviction && def.scopes.includes('chain')) {
+        const pattern = this.buildPattern(def.key, context.chainId ? { chainId: context.chainId } : {});
+        (await this.findKeysByPattern(pattern)).forEach((k) => invalidatedKeys.add(k));
       }
     }
 
-    this.logger.log(`Cache invalidation triggered by ${event}: ${invalidatedKeys.length} keys invalidated`);
+    for (const key of invalidatedKeys) {
+      await this.redisService.del(key);
+    }
+
+    this.logger.log(`Cache invalidation triggered by ${event}: ${invalidatedKeys.size} keys invalidated`);
 
     return {
-      invalidatedCount: invalidatedKeys.length,
-      invalidatedKeys,
+      invalidatedCount: invalidatedKeys.size,
+      invalidatedKeys: [...invalidatedKeys],
       triggers,
     };
   }
@@ -311,6 +347,20 @@ export class CacheKeyRegistryService implements OnModuleInit {
     }
     if (!def.scopes || def.scopes.length === 0) {
       throw new Error('At least one scope must be specified');
+    }
+    if (!def.invalidationTriggers || def.invalidationTriggers.length === 0) {
+      throw new Error('At least one invalidation trigger must be specified');
+    }
+    for (const trigger of def.invalidationTriggers) {
+      if (!(INVALIDATION_EVENTS as readonly string[]).includes(trigger.event)) {
+        throw new Error(`Unknown invalidation trigger "${trigger.event}" for cache key ${def.key}`);
+      }
+    }
+    if (this.registry.has(def.key)) {
+      throw new Error(`Duplicate cache key definition: ${def.key}`);
+    }
+    if (def.scopes.includes('chain') && !def.key.includes('{chainId}')) {
+      throw new Error(`Chain-scoped cache key ${def.key} must include {chainId} to isolate chain namespaces`);
     }
   }
 
@@ -444,6 +494,9 @@ export class CacheKeyRegistryService implements OnModuleInit {
         ttlSeconds: 3600,
         scopes: ['chain'],
         tags: ['blockchain', 'block'],
+        invalidationTriggers: [
+          { event: 'blockchain.reorg', pattern: 'blockchain:block:*' },
+        ],
       },
       {
         key: 'blockchain:events:{chainId}:{contractAddress}:{fromBlock}:{toBlock}',
@@ -528,6 +581,9 @@ export class CacheKeyRegistryService implements OnModuleInit {
         ttlSeconds: 300,
         scopes: ['chain'],
         tags: ['analytics', 'metrics'],
+        invalidationTriggers: [
+          { event: 'analytics.updated', pattern: 'analytics:metrics:*' },
+        ],
       },
       {
         key: 'analytics:events:{chainId}:{eventType}:{fromBlock}:{toBlock}',
@@ -536,6 +592,9 @@ export class CacheKeyRegistryService implements OnModuleInit {
         ttlSeconds: 600,
         scopes: ['chain'],
         tags: ['analytics', 'events'],
+        invalidationTriggers: [
+          { event: 'analytics.updated', pattern: 'analytics:events:*' },
+        ],
       },
 
       // Search
@@ -593,7 +652,7 @@ export class CacheKeyRegistryService implements OnModuleInit {
   /**
    * Find keys by pattern (placeholder - uses SCAN in production)
    */
-  private async findKeysByPattern(pattern: string): Promise<string[]> {
+  protected async findKeysByPattern(pattern: string): Promise<string[]> {
     // In production, use Redis SCAN command
     // For now, return empty array
     return [];

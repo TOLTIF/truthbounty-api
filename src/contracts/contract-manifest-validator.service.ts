@@ -10,6 +10,7 @@ import {
   ManifestContractValidationResult,
   ManifestValidationReport,
 } from './contract-manifest.interface';
+import { AbiValidationService } from './abi-validation.service';
 
 /**
  * ContractManifestValidatorService
@@ -39,6 +40,12 @@ import {
  *    g. Optional topic0 cross-check: when present, the supplied topic0 hash
  *       must match ethers.id(canonical_event_signature).
  *    h. Per-contract abiChecksum (SHA-256 of JSON.stringify(events)) must match
+ *    i. **NEW (post-Wave-9)**: Overload detection and validation
+ *    j. **NEW**: Topic0/selector collision detection (fail closed)
+ *    k. **NEW**: Anonymous event detection and flagging
+ *    l. **NEW**: Duplicate event signature detection (fail closed)
+ *    m. **NEW**: Indexed field layout validation
+ *    n. **NEW**: Canonical signature validation for all events
  * 6. Optional on-chain code check (disabled with BLOCKCHAIN_STARTUP_RPC_CHECK=false):
  *    - Validates RPC chain ID against manifest chainId
  *    - Calls eth_getCode for each address; no deployed bytecode → fail closed
@@ -53,7 +60,10 @@ import {
 export class ContractManifestValidatorService implements OnApplicationBootstrap {
   private readonly logger = new Logger(ContractManifestValidatorService.name);
 
-  constructor(private readonly configService: ConfigService) {}
+  constructor(
+    private readonly configService: ConfigService,
+    private readonly abiValidation: AbiValidationService,
+  ) {}
 
   /**
    * Called by NestJS after all modules are initialised.
@@ -111,6 +121,7 @@ export class ContractManifestValidatorService implements OnApplicationBootstrap 
     manifest: ContractAddressManifest,
   ): Promise<ManifestValidationReport> {
     const errors: string[] = [];
+    const warnings: string[] = [];
 
     // ── 1. Schema presence checks ──────────────────────────────────────────
     if (!manifest || typeof manifest !== 'object') {
@@ -121,6 +132,7 @@ export class ContractManifestValidatorService implements OnApplicationBootstrap 
         contractCount: 0,
         contractResults: [],
         errors: ['manifest must be a non-null object'],
+        warnings: [],
       };
     }
 
@@ -158,6 +170,7 @@ export class ContractManifestValidatorService implements OnApplicationBootstrap 
         contractCount: 0,
         contractResults: [],
         errors,
+        warnings: [],
       };
     }
 
@@ -215,6 +228,13 @@ export class ContractManifestValidatorService implements OnApplicationBootstrap 
             result.errors.join('; '),
         );
       }
+      if (result.warnings.length > 0) {
+        warnings.push(
+          ...result.warnings.map(
+            (w) => `contract "${result.name}" (${result.address}): ${w}`,
+          ),
+        );
+      }
     }
 
     // ── 6. Optional on-chain code verification ────────────────────────────
@@ -235,6 +255,7 @@ export class ContractManifestValidatorService implements OnApplicationBootstrap 
       contractCount: manifest.contracts.length,
       contractResults,
       errors,
+      warnings,
       manifestAgedays: manifestAgeDays,
     };
   }
@@ -246,6 +267,7 @@ export class ContractManifestValidatorService implements OnApplicationBootstrap 
     contract: ManifestContractEntry,
   ): ManifestContractValidationResult {
     const errors: string[] = [];
+    const warnings: string[] = [];
     const name = contract?.name ?? '<unnamed>';
     const address = contract?.address ?? '';
 
@@ -299,16 +321,84 @@ export class ContractManifestValidatorService implements OnApplicationBootstrap 
             errors.push(
               `event "${event.name}" ABI parses as "${fragment.type}", expected "event"`,
             );
-          } else if (event.topic0) {
-            // Cross-check the declared topic0 against the ABI-derived topic0.
+          } else {
             const eventFragment = fragment as ethers.EventFragment;
-            const derivedTopic0 = ethers.id(eventFragment.format('sighash'));
-            const normalizedDeclared = event.topic0.toLowerCase();
-            if (derivedTopic0.toLowerCase() !== normalizedDeclared) {
-              errors.push(
-                `event "${event.name}" topic0 mismatch: ` +
-                  `declared ${normalizedDeclared} but ABI derives ${derivedTopic0.toLowerCase()}`,
+
+            // ── NEW: Validate topic0 (required for production, null for anonymous) ──
+            if (event.topic0 !== undefined) {
+              if (eventFragment.anonymous && event.topic0 !== null) {
+                errors.push(
+                  `event "${event.name}" is anonymous but has non-null topic0`,
+                );
+              } else if (!eventFragment.anonymous && event.topic0 === null) {
+                errors.push(
+                  `event "${event.name}" is not anonymous but has null topic0`,
+                );
+              } else if (event.topic0 !== null) {
+                // Cross-check the declared topic0 against the ABI-derived topic0.
+                const derivedTopic0 = ethers.id(eventFragment.format('sighash'));
+                const normalizedDeclared = event.topic0.toLowerCase();
+                if (derivedTopic0.toLowerCase() !== normalizedDeclared) {
+                  errors.push(
+                    `event "${event.name}" topic0 mismatch: ` +
+                      `declared ${normalizedDeclared} but ABI derives ${derivedTopic0.toLowerCase()}`,
+                  );
+                }
+              }
+            }
+
+            // ── NEW: Validate anonymous flag consistency ──
+            if (event.anonymous !== undefined) {
+              if (event.anonymous !== eventFragment.anonymous) {
+                errors.push(
+                  `event "${event.name}" anonymous flag mismatch: ` +
+                    `manifest says ${event.anonymous} but ABI says ${eventFragment.anonymous}`,
+                );
+              }
+            }
+
+            // ── NEW: Validate signature field ──
+            if (event.signature !== undefined) {
+              const derivedSignature = eventFragment.format('sighash');
+              if (event.signature !== derivedSignature) {
+                errors.push(
+                  `event "${event.name}" signature mismatch: ` +
+                    `manifest has "${event.signature}" but ABI derives "${derivedSignature}"`,
+                );
+              }
+            }
+
+            // ── NEW: Validate indexed parameters metadata ──
+            if (event.indexed !== undefined) {
+              const derivedIndexed = this.abiValidation.extractIndexedParameters(
+                event.abi,
               );
+              
+              if (event.indexed.length !== derivedIndexed.length) {
+                errors.push(
+                  `event "${event.name}" indexed parameter count mismatch: ` +
+                    `manifest has ${event.indexed.length} but ABI has ${derivedIndexed.length}`,
+                );
+              } else {
+                // Validate each indexed parameter
+                for (let i = 0; i < event.indexed.length; i++) {
+                  const manifestParam = event.indexed[i];
+                  const derivedParam = derivedIndexed[i];
+
+                  if (manifestParam.type !== derivedParam.type) {
+                    errors.push(
+                      `event "${event.name}" indexed[${i}] type mismatch: ` +
+                        `manifest has "${manifestParam.type}" but ABI has "${derivedParam.type}"`,
+                    );
+                  }
+                  if (manifestParam.position !== derivedParam.position) {
+                    errors.push(
+                      `event "${event.name}" indexed[${i}] position mismatch: ` +
+                        `manifest has ${manifestParam.position} but ABI has ${derivedParam.position}`,
+                    );
+                  }
+                }
+              }
             }
           }
         } catch (err) {
@@ -327,9 +417,20 @@ export class ContractManifestValidatorService implements OnApplicationBootstrap 
           );
         }
       }
+
+      // ── NEW: Production-grade ABI validation ──
+      const abiStrings = contract.events.map((e) => e.abi);
+      const manifestValidation =
+        this.abiValidation.validateManifestEventSet(abiStrings);
+
+      // Add errors from ABI validation (collisions, duplicates)
+      errors.push(...manifestValidation.errors);
+
+      // Add warnings (overloads, anonymous events)
+      warnings.push(...manifestValidation.warnings);
     }
 
-    return { name, address, valid: errors.length === 0, errors };
+    return { name, address, valid: errors.length === 0, errors, warnings };
   }
 
   /**

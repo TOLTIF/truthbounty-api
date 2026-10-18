@@ -684,4 +684,321 @@ describe('V2Outbox integration (sqlite in-memory)', () => {
       expect(afterCount).toBe(beforeCount + 1);
     });
   });
+
+  // ── Two-worker claim race ─────────────────────────────────────────────────
+
+  describe('two-worker claim race', () => {
+    it('guarantees exactly one worker claims and dispatches each message under concurrent polling', async () => {
+      // Create a second worker instance sharing the exact same DataSource and Queue
+      const worker2 = new V2OutboxWorker(
+        dataSource,
+        mockQueue as any,
+        metricsStub as any,
+      );
+
+      // Seed 5 pending messages
+      for (let i = 1; i <= 5; i++) {
+        await dataSource.transaction((m) =>
+          service.publishWithManager(m, {
+            aggregateType: 'claim',
+            aggregateId: `race-claim-${i}`,
+            eventType: 'notification.send',
+            payload: { channel: 'in_app' },
+          }),
+        );
+      }
+
+      expect(await repo.countBy({ status: V2OutboxStatus.PENDING })).toBe(5);
+
+      // Run both workers concurrently
+      await Promise.all([
+        worker.pollAndDispatch(),
+        worker2.pollAndDispatch(),
+      ]);
+
+      // Every message must be DISPATCHED
+      const dispatchedCount = await repo.countBy({
+        status: V2OutboxStatus.DISPATCHED,
+      });
+      expect(dispatchedCount).toBe(5);
+
+      // Exactly 5 BullMQ jobs must have been queued (no duplicates)
+      expect(mockQueue.add).toHaveBeenCalledTimes(5);
+
+      // Verify that every message has a unique BullMQ job recorded
+      const rows = await repo.find();
+      const jobIds = rows.map((r) => r.jobId);
+      expect(new Set(jobIds).size).toBe(5);
+    });
+  });
+
+  // ── Crash after side effect ───────────────────────────────────────────────
+
+  describe('crash after side effect', () => {
+    it('recovers crashed PROCESSING row and deduplicates BullMQ dispatch on replay', async () => {
+      const result = await dataSource.transaction((m) =>
+        service.publishWithManager(m, {
+          aggregateType: 'claim',
+          aggregateId: 'crash-claim-1',
+          eventType: 'notification.send',
+          payload: { channel: 'in_app' },
+        }),
+      );
+
+      // Worker claims the row and dispatches to BullMQ, but crashes before DB update
+      // Simulate by placing the row in PROCESSING with an expired deadline
+      const pastDeadline = new Date(Date.now() - 60_000);
+      await repo.update(result.id, {
+        status: V2OutboxStatus.PROCESSING,
+        processingDeadline: pastDeadline,
+      });
+
+      // Side effect occurred in BullMQ
+      mockQueue.add.mockResolvedValueOnce({ id: 'job-crash-1' });
+      await mockQueue.add(V2_OUTBOX_JOB_NAME, { outboxMessageId: result.id }, {
+        jobId: `outbox-${result.idempotencyKey}`,
+      });
+      expect(mockQueue.add).toHaveBeenCalledTimes(1);
+
+      // Crash recovery pass runs
+      await worker.recoverStuckMessages();
+
+      const recovered = await repo.findOneByOrFail({ id: result.id });
+      expect(recovered.status).toBe(V2OutboxStatus.PENDING);
+      expect(recovered.processingDeadline).toBeNull();
+
+      // Next worker cycle runs and redelivers
+      await worker.pollAndDispatch();
+
+      const finalRow = await repo.findOneByOrFail({ id: result.id });
+      expect(finalRow.status).toBe(V2OutboxStatus.DISPATCHED);
+      expect(finalRow.jobId).toBeDefined();
+
+      // The BullMQ jobId was identical across dispatches (deduplicating at queue layer)
+      const calls = mockQueue.add.mock.calls;
+      const lastCallOpts = calls[calls.length - 1][2];
+      expect(lastCallOpts.jobId).toBe(`outbox-${result.idempotencyKey}`);
+    });
+  });
+
+  // ── Clock-skew tests ──────────────────────────────────────────────────────
+
+  describe('clock-skew handling', () => {
+    it('does not claim a message when worker clock is skewed behind scheduledAt', async () => {
+      const targetTime = new Date(Date.now() + 5000); // 5s in future
+      await dataSource.transaction((m) =>
+        service.publishWithManager(m, {
+          aggregateType: 'claim',
+          aggregateId: 'clock-skew-future',
+          eventType: 'notification.send',
+          payload: {},
+          scheduledAt: targetTime,
+        }),
+      );
+
+      // Poll run when clock is still before scheduledAt
+      await worker.pollAndDispatch();
+
+      expect(mockQueue.add).not.toHaveBeenCalled();
+      const row = await repo.findOneByOrFail({ aggregateId: 'clock-skew-future' });
+      expect(row.status).toBe(V2OutboxStatus.PENDING);
+    });
+
+    it('crash recovery respects processingDeadline and does not recover active claims prematurely', async () => {
+      const result = await dataSource.transaction((m) =>
+        service.publishWithManager(m, {
+          aggregateType: 'claim',
+          aggregateId: 'clock-skew-recovery',
+          eventType: 'notification.send',
+          payload: {},
+        }),
+      );
+
+      // Active claim with 20s remaining on its deadline
+      const activeDeadline = new Date(Date.now() + 20_000);
+      await repo.update(result.id, {
+        status: V2OutboxStatus.PROCESSING,
+        processingDeadline: activeDeadline,
+      });
+
+      // Recovery pass runs while worker is still within deadline
+      await worker.recoverStuckMessages();
+
+      // Must NOT be reset — active claim is protected
+      const activeRow = await repo.findOneByOrFail({ id: result.id });
+      expect(activeRow.status).toBe(V2OutboxStatus.PROCESSING);
+
+      // Now simulate clock advancing past deadline
+      const expiredDeadline = new Date(Date.now() - 5000);
+      await repo.update(result.id, { processingDeadline: expiredDeadline });
+
+      await worker.recoverStuckMessages();
+
+      // Must be safely recovered
+      const recoveredRow = await repo.findOneByOrFail({ id: result.id });
+      expect(recoveredRow.status).toBe(V2OutboxStatus.PENDING);
+    });
+  });
+
+  // ── Identifier validation & persistence boundary ─────────────────────────
+
+  describe('identifier validation and persistence boundary', () => {
+    it('rejects invalid or oversized aggregate identifiers before database write', async () => {
+      // Oversized aggregateType
+      await expect(
+        dataSource.transaction((m) =>
+          service.publishWithManager(m, {
+            aggregateType: 'a'.repeat(129),
+            aggregateId: 'c-valid',
+            eventType: 'notification.send',
+            payload: {},
+          }),
+        ),
+      ).rejects.toThrow('aggregateType exceeds 128 characters');
+
+      // Oversized aggregateId
+      await expect(
+        dataSource.transaction((m) =>
+          service.publishWithManager(m, {
+            aggregateType: 'claim',
+            aggregateId: 'c'.repeat(129),
+            eventType: 'notification.send',
+            payload: {},
+          }),
+        ),
+      ).rejects.toThrow('aggregateId exceeds 128 characters');
+
+      // Invalid characters in aggregateType
+      await expect(
+        dataSource.transaction((m) =>
+          service.publishWithManager(m, {
+            aggregateType: 'invalid type with spaces',
+            aggregateId: 'c-1',
+            eventType: 'notification.send',
+            payload: {},
+          }),
+        ),
+      ).rejects.toThrow('aggregateType contains invalid characters');
+
+      // Invalid eventType format
+      await expect(
+        dataSource.transaction((m) =>
+          service.publishWithManager(m, {
+            aggregateType: 'claim',
+            aggregateId: 'c-1',
+            eventType: 'invalid_event_no_namespace',
+            payload: {},
+          }),
+        ),
+      ).rejects.toThrow('eventType format is invalid');
+
+      // Zero rows persisted on validation failure
+      const count = await repo.count();
+      expect(count).toBe(0);
+    });
+  });
+
+  // ── Chain provenance binding ──────────────────────────────────────────────
+
+  describe('chain provenance binding', () => {
+    it('binds chain-derived data and produces distinct idempotency keys per chain', async () => {
+      const p1 = await dataSource.transaction((m) =>
+        service.publishWithManager(m, {
+          aggregateType: 'claim',
+          aggregateId: 'c-chain-1',
+          eventType: 'notification.send',
+          payload: {
+            channel: 'in_app',
+            chainProvenance: {
+              chainId: 11155420, // OP Sepolia
+              releaseId: 'v2.0.0-sepolia',
+              deploymentBlock: '1234567',
+              artifactChecksum: 'a'.repeat(64),
+            },
+          },
+        }),
+      );
+
+      const p2 = await dataSource.transaction((m) =>
+        service.publishWithManager(m, {
+          aggregateType: 'claim',
+          aggregateId: 'c-chain-1',
+          eventType: 'notification.send',
+          payload: {
+            channel: 'in_app',
+            chainProvenance: {
+              chainId: 10, // OP Mainnet
+              releaseId: 'v2.0.0-sepolia',
+              deploymentBlock: '1234567',
+              artifactChecksum: 'a'.repeat(64),
+            },
+          },
+        }),
+      );
+
+      expect(p1.idempotencyKey).not.toBe(p2.idempotencyKey);
+
+      const rows = await repo.find();
+      expect(rows).toHaveLength(2);
+    });
+
+    it('fails closed on invalid chain provenance', async () => {
+      await expect(
+        dataSource.transaction((m) =>
+          service.publishWithManager(m, {
+            aggregateType: 'claim',
+            aggregateId: 'c-fail-prov',
+            eventType: 'notification.send',
+            payload: {
+              chainProvenance: {
+                chainId: -1, // invalid
+                releaseId: 'v2.0.0',
+                deploymentBlock: '100',
+                artifactChecksum: 'a'.repeat(64),
+              },
+            },
+          }),
+        ),
+      ).rejects.toThrow('chainId must be a positive integer');
+    });
+  });
+
+  // ── Delivery history & auditability ───────────────────────────────────────
+
+  describe('delivery history auditability', () => {
+    it('audits full lifecycle history of an aggregate through getDeliveryHistory', async () => {
+      await dataSource.transaction((m) =>
+        service.publishWithManager(m, {
+          aggregateType: 'claim',
+          aggregateId: 'audit-claim-99',
+          eventType: 'notification.send',
+          payload: { channel: 'in_app' },
+        }),
+      );
+
+      await worker.pollAndDispatch();
+
+      const history = await service.getDeliveryHistory('claim', 'audit-claim-99');
+      expect(history).toHaveLength(1);
+      expect(history[0].status).toBe(V2OutboxStatus.DISPATCHED);
+      expect(history[0].jobId).toBe('job-integration-1');
+      expect(history[0].processedAt).toBeInstanceOf(Date);
+      expect(history[0].idempotencyKey).toHaveLength(64);
+    });
+
+    it('audits messages by unique idempotency key', async () => {
+      const res = await dataSource.transaction((m) =>
+        service.publishWithManager(m, {
+          aggregateType: 'claim',
+          aggregateId: 'audit-key-test',
+          eventType: 'notification.send',
+          payload: {},
+        }),
+      );
+
+      const found = await service.getMessageByIdempotencyKey(res.idempotencyKey);
+      expect(found).not.toBeNull();
+      expect(found?.aggregateId).toBe('audit-key-test');
+    });
+  });
 });

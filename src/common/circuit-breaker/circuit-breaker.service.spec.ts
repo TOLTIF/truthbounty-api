@@ -137,6 +137,38 @@ describe('CircuitBreaker — state transitions', () => {
     expect(cb.currentState).toBe('OPEN');
   });
 
+  it('allows only one in-flight half-open probe', async () => {
+    const cb = makeCb({ failureThreshold: 1, resetMs: 5 });
+    await cb.call(fail).catch(() => {});
+    await new Promise((r) => setTimeout(r, 10));
+
+    let releaseProbe!: (value: string) => void;
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const firstProbe = cb.call(() => new Promise<string>((resolve) => {
+      releaseProbe = resolve;
+      markStarted();
+    }));
+    await started;
+
+    await expect(cb.call(succeed)).rejects.toBeInstanceOf(CircuitOpenError);
+    releaseProbe('healthy');
+    await expect(firstProbe).resolves.toBe('healthy');
+    expect(cb.currentState).toBe('CLOSED');
+  });
+
+  it('does not count caller validation errors as dependency failures', async () => {
+    const cb = makeCb({
+      failureThreshold: 1,
+      shouldCountFailure: (error) => !(error instanceof TypeError),
+    });
+    await expect(cb.call(() => Promise.reject(new TypeError('bad input'))))
+      .rejects.toThrow('bad input');
+    expect(cb.currentState).toBe('CLOSED');
+    expect(cb.snapshot().failures).toBe(0);
+    expect(cb.snapshot().totalFailures).toBe(1);
+  });
+
   it('resets consecutive failure counter on a successful call', async () => {
     const cb = makeCb({ failureThreshold: 3 });
     try {

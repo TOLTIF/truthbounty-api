@@ -6,6 +6,10 @@ import {
   Logger,
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
+import {
+  AuthenticatedRequest,
+  isAuthenticatedRequest,
+} from '../types/authenticated-request';
 
 /**
  * Metadata key for marking endpoints as admin-only.
@@ -16,7 +20,8 @@ export const ADMIN_ONLY_KEY = 'adminOnly';
  * Admin Guard
  *
  * Protects endpoints that require admin privileges.
- * Checks for an 'admin' role in the JWT payload or a configured admin wallet list.
+ * Checks for an 'admin' role in the verified principal or a configured admin
+ * wallet list.
  *
  * Usage:
  *   @UseGuards(AdminGuard)
@@ -51,31 +56,33 @@ export class AdminGuard implements CanActivate {
       return true;
     }
 
-    const request = context.switchToHttp().getRequest();
-    const user = request.user;
+    const request = context.switchToHttp().getRequest<Request>();
 
-    if (!user) {
+    if (!isAuthenticatedRequest(request)) {
       this.logger.warn('Admin access denied: no authenticated user');
       throw new ForbiddenException('Authentication required for admin access');
     }
 
-    // Check if user has admin role from JWT
-    if (
-      user.roles &&
-      Array.isArray(user.roles) &&
-      user.roles.includes('admin')
-    ) {
+    const principal = (request as AuthenticatedRequest).use;
+    if (!principal) {
+      this.logger.warn('Admin access denied: no authenticated user');
+      throw new ForbiddenException('Authentication required for admin access');
+    }
+
+    // Check if user has admin role from the verified principal.
+    const role = principal.user?.role;
+    if (role === 'admin') {
       return true;
     }
 
     // Check if wallet address is in admin list
-    const userAddress = user.address?.toLowerCase();
-    if (userAddress && this.adminAddresses.has(userAddress)) {
+    const userAddress = principal.address.toLowerCase();
+    if (this.adminAddresses.has(userAddress)) {
       return true;
     }
 
     // Check userId-based admin list
-    const userId = user.userId || user.sub;
+    const userId = principal.userId || principal.sub;
     if (userId && this.adminAddresses.has(userId)) {
       return true;
     }
