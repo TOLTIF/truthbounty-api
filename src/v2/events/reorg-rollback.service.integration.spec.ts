@@ -30,6 +30,7 @@ import {
   EvidenceStatus,
 } from '../evidence/entities/project-evidence.entity';
 import { ProjectEvidenceVersion } from '../evidence/entities/project-evidence-version.entity';
+import { V2OutboxService } from '../outbox/v2-outbox.service';
 import {
   ProjectVerificationRound,
   RoundType,
@@ -123,6 +124,15 @@ describe('ReorgRollbackService (integration)', () => {
         CanonicalEventQueryService,
         ReorgRollbackService,
         EvidenceProjectorService,
+        {
+          provide: V2OutboxService,
+          useValue: {
+            publishWithManager: jest.fn().mockResolvedValue({
+              id: 'test-outbox-message',
+              idempotencyKey: 'test-idempotency-key',
+            }),
+          },
+        },
         EvidenceQueryService,
         VerificationProjectorService,
         VerificationQueryService,

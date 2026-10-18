@@ -224,6 +224,11 @@ Sybil resistance scoring.
 |--------|----------|-------------|
 | POST | `/sybil/users/:userId/score` | Compute and store Sybil score |
 | GET | `/sybil/users/:userId/score` | Get most recent Sybil score |
+| GET | `/sybil/users/:userId/public-score` | Get privacy-safe public Sybil score (redacted) |
+| POST | `/sybil/users/:userId/recompute` | Deterministic recompute with pinned version |
+| POST | `/sybil/users/:userId/appeal` | Submit appeal against score evaluation |
+| GET | `/sybil/users/:userId/appeals` | Get appeal history for user |
+| GET | `/sybil/models` | List available Sybil score model versions |
 | GET | `/sybil/users/:userId/history` | Get Sybil score history |
 | GET | `/sybil/users/:userId/voting` | Get Sybil score for voting |
 | POST | `/sybil/users/:userId/verify-worldcoin` | Mark user as Worldcoin verified |

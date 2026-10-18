@@ -218,6 +218,7 @@ export class ClaimFeedService {
         self: `/api/v2/claims/${claim.id}`,
         evidence: `/api/v2/claims/${claim.id}/evidence`,
         stakes: `/api/v2/claims/${claim.id}/stakes`,
+        settlement: `/api/v2/claims/${claim.id}/settlement`,
       },
     };
   }

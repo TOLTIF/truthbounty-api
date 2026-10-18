@@ -16,7 +16,7 @@
     "pretype-check": "npm run generate:prinrequisites",
     "type-check": "tsc --noEmit",
     "prebuild": "npm run generate:prinrequisites && npm run type-check",
-    "build": "nest build",
+    "build": "node api.js && nest build",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage",
@@ -29,11 +29,16 @@
     "db:restore:test": "ts-node src/scripts/backup-restore-drill.ts",
     "seed": "ts-node src/scripts/seed.ts",
     "seed:ai": "ts-node src/scripts/seed-ai-knowledge-base.ts",
+    "smoke:staging": "ts-node src/scripts/staging-smoke.ts",
     "benchmark:indexes": "ts-node scripts/benchmark-indexes.ts",
     "benchmark:compare": "ts-node scripts/compare-benchmarks.ts",
     "test:integration": "DB_TYPE= postgres jest --config ./test/jest-integration.json --runInBand",
     "test:migration-parity": "jest --config ./test/jest-integration.json --runInBand --testPathPattern migration-parity",
-    "security:dependencies": "node scripts/dependency-audit.mjs"
+    "security:dependencies": "node scripts/dependency-audit.mjs",
+    "audit:verify": "ts-node src/scripts/audit-chain.ts verify",
+    "audit:checkpoint": "ts-node src/scripts/audit-chain.ts checkpoint",
+    "audit:export": "ts-node src/scripts/audit-chain.ts export",
+    "audit:corruption-report": "ts-node src/scripts/audit-chain.ts corruption-report"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.128.0",

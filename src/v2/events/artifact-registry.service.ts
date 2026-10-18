@@ -42,7 +42,7 @@ export class ArtifactRegistryService {
   ): Promise<ResolvedArtifact | null> {
     if (
       !Number.isInteger(chainId) ||
-      chainId <= 0 ||
+      !this.isSupportedChain(chainId) ||
       typeof contractAddress !== 'string' ||
       contractAddress.trim() === '' ||
       !/^0x[a-fA-F0-9]{40}$/.test(contractAddress.trim())

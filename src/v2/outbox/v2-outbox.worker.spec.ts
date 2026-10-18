@@ -49,7 +49,7 @@ function makeQueryBuilderChain(
     andWhere: jest.fn().mockReturnThis(),
     whereInIds: jest.fn().mockReturnThis(),
     limit: jest.fn().mockReturnThis(),
-    execute: overrides.execute ?? jest.fn().mockResolvedValue({ affected: 0 }),
+    execute: overrides.execute ?? jest.fn().mockResolvedValue({ affected: 1 }),
     createQueryBuilder: jest.fn().mockReturnThis(),
     addOrderBy: jest.fn().mockReturnThis(),
     orderBy: jest.fn().mockReturnThis(),
@@ -401,9 +401,9 @@ describe('V2OutboxWorker', () => {
     });
   });
 
-  // ── Concurrent worker safety ──────────────────────────────────────────────
+  // ── Concurrent worker safety & Claim Locking ────────────────────────────
 
-  describe('concurrent worker safety', () => {
+  describe('concurrent worker safety & claim locking', () => {
     it('the in-process guard prevents overlapping poll cycles', async () => {
       // Simulate long-running poll
       (worker as any).isPolling = true;
@@ -414,6 +414,82 @@ describe('V2OutboxWorker', () => {
       // recoverStuckMessages is part of the poll cycle; it must not be called
       // while another cycle is in flight.
       expect(recoverSpy).not.toHaveBeenCalled();
+    });
+
+    it('claimBatch only dispatches rows where conditional lock succeeded (affected = 1)', async () => {
+      const msg1 = makeMsg({ id: 'msg-won' });
+      const msg2 = makeMsg({ id: 'msg-lost' });
+
+      // Worker selects both msg1 and msg2 as candidates, but msg2 is won by a concurrent worker
+      const execMock = jest
+        .fn()
+        .mockResolvedValueOnce({ affected: 1 }) // msg1 lock succeeds
+        .mockResolvedValueOnce({ affected: 0 }); // msg2 was claimed by competing worker
+
+      const qb = makeQueryBuilderChain({
+        getMany: jest.fn().mockResolvedValue([msg1, msg2]),
+        execute: execMock,
+      });
+
+      mockDataSource.transaction = jest.fn().mockImplementation(
+        async (cb: (m: any) => Promise<any>) => {
+          const manager = {
+            getRepository: jest.fn().mockReturnValue({
+              ...mockRepo,
+              createQueryBuilder: jest.fn(() => qb),
+            }),
+          };
+          return cb(manager);
+        },
+      );
+
+      await worker.pollAndDispatch();
+
+      // Exactly ONE message (msg-won) must be dispatched
+      expect(mockQueue.add).toHaveBeenCalledTimes(1);
+      expect(mockQueue.add).toHaveBeenCalledWith(
+        V2_OUTBOX_JOB_NAME,
+        expect.objectContaining({ outboxMessageId: 'msg-won' }),
+        expect.any(Object),
+      );
+    });
+
+    it('dead-letters a message with invalid eventType before queuing', async () => {
+      const invalidMsg = makeMsg({ id: 'msg-invalid-type', eventType: 'invalid_no_dot' });
+
+      mockDataSource.transaction = jest.fn().mockImplementation(
+        async (cb: (m: any) => Promise<any>) => {
+          const qb = makeQueryBuilderChain({
+            getMany: jest.fn().mockResolvedValue([invalidMsg]),
+            execute: jest.fn().mockResolvedValue({ affected: 1 }),
+          });
+          const manager = {
+            getRepository: jest.fn().mockReturnValue({
+              ...mockRepo,
+              createQueryBuilder: jest.fn(() => qb),
+            }),
+          };
+          return cb(manager);
+        },
+      );
+
+      await worker.pollAndDispatch();
+
+      // Queue should NOT be called
+      expect(mockQueue.add).not.toHaveBeenCalled();
+
+      // Message must be transitioned to DEAD_LETTER
+      expect(mockRepo.update).toHaveBeenCalledWith(
+        { id: 'msg-invalid-type', status: V2OutboxStatus.PROCESSING },
+        expect.objectContaining({
+          status: V2OutboxStatus.DEAD_LETTER,
+          lastError: expect.stringContaining('Unknown or invalid eventType'),
+        }),
+      );
+      expect(mockMetrics.incrementCounter).toHaveBeenCalledWith(
+        'v2_outbox_dead_lettered_total',
+        1,
+      );
     });
   });
 

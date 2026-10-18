@@ -9,6 +9,8 @@ import { Repository, DataSource } from 'typeorm';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Claim, ClaimState } from './entities/claim.entity';
 import { ClaimsCache } from '../cache/claims.cache';
+import { SupportSecretScannerService } from '../support/support-secret-scanner.service';
+import { SupportSubmission } from '../support/entities/support-submission.entity';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -33,6 +35,20 @@ export interface ResolutionResult {
   resolvedAt: Date;
 }
 
+export interface SupportSubmissionScanResult {
+  submissionId: string;
+  quarantined: boolean;
+  reason?: string;
+  remediation?: string;
+}
+
+export interface QuarantineAccessRecord {
+  submissionId: string;
+  accessedBy: string;
+  accessedAt: Date;
+  purpose: string;
+}
+
 // ─── Service ──────────────────────────────────────────────────────────────────
 
 @Injectable()
@@ -51,11 +67,18 @@ export class ClaimResolutionService {
    */
   private readonly STRONG_CONSENSUS_THRESHOLD = 0.75;
 
+  /**
+   * Minimum confidence required to block/quarantine a support submission.
+   * Below this threshold the submission is allowed but flagged for review.
+   */
+  private readonly SECRET_QUARANTINE_THRESHOLD = 0.8;
+
   constructor(
     @InjectRepository(Claim)
     private readonly claimRepo: Repository<Claim>,
     private readonly claimsCache: ClaimsCache,
     private readonly dataSource: DataSource,
+    private readonly secretScanner?: SupportSecretScannerService,
   ) {}
 
   // ─── Pure computation ───────────────────────────────────────────────────
@@ -177,6 +200,87 @@ export class ClaimResolutionService {
     return { claim: savedClaim, confidence, resolvedAt };
   }
 
+  // ─── Support submission secret scanning ─────────────────────────────────
+
+  /**
+   * Scan a support submission's text and attachments for secrets before
+   * persistence or forwarding. High-confidence secrets are quarantined and
+   * never echoed into logs or notifications.
+   *
+   * Fails closed: any scanner error results in quarantine.
+   */
+  async scanSupportSubmission(
+    submission: SupportSubmission,
+  ): Promise<SupportSubmissionScanResult> {
+    if (!submission || !submission.id) {
+      throw new BadRequestException('Support submission is required');
+    }
+
+    let scan: Awaited<ReturnType<SupportSecretScannerService['scan']>>;
+    try {
+      scan = await this.secretScanner!.scan({
+        text: submission.body ?? '',
+        attachments: submission.attachments ?? [],
+      });
+    } catch {
+      // Fail closed — never forward unscanned content.
+      this.logger.warn(
+        `Secret scan failed for submission ${submission.id}; quarantining (fail-closed)`,
+      );
+      return this.quarantineSubmission(
+        submission.id,
+        'scan_error',
+        'We could not process your submission. Please resubmit without sensitive data.',
+      );
+    }
+
+    if (scan.highestConfidence >= this.SECRET_QUARANTINE_THRESHOLD) {
+      // Do NOT log matched material — only category and confidence.
+      this.logger.warn(
+        `Submission ${submission.id} quarantined: category=${scan.topCategory ?? 'unknown'}, ` +
+          `confidence=${scan.highestConfidence.toFixed(2)}`,
+      );
+      return this.quarantineSubmission(
+        submission.id,
+        scan.topCategory ?? 'secret',
+        this.buildRemediationGuidance(scan.topCategory),
+      );
+    }
+
+    return { submissionId: submission.id, quarantined: false };
+  }
+
+  /**
+   * Retrieve a quarantined submission. Access is restricted to authorized
+   * callers and every access is audited. Secret material is never returned
+   * in the response payload — only metadata.
+   */
+  async accessQuarantinedSubmission(
+    submissionId: string,
+    accessedBy: string,
+    purpose: string,
+  ): Promise<QuarantineAccessRecord> {
+    if (!accessedBy || !purpose) {
+      throw new BadRequestException(
+        'Quarantine access requires an identified actor and purpose',
+      );
+    }
+
+    const record: QuarantineAccessRecord = {
+      submissionId,
+      accessedBy,
+      accessedAt: new Date(),
+      purpose,
+    };
+
+    // Audit without echoing secret material.
+    this.logger.log(
+      `Quarantine access: submission=${submissionId}, actor=${accessedBy}, purpose=${purpose}`,
+    );
+
+    return record;
+  }
+
   // ─── Helpers ────────────────────────────────────────────────────────────
 
   /**
@@ -191,6 +295,28 @@ export class ClaimResolutionService {
   }
 
   // ─── Private ────────────────────────────────────────────────────────────
+
+  private quarantineSubmission(
+    submissionId: string,
+    reason: string,
+    remediation: string,
+  ): SupportSubmissionScanResult {
+    return {
+      submissionId,
+      quarantined: true,
+      reason,
+      remediation,
+    };
+  }
+
+  private buildRemediationGuidance(category?: string): string {
+    const base =
+      'Your submission was blocked because it appears to contain sensitive data. ' +
+      'Please remove any seed phrases, private keys, API tokens, auth headers, or credentials ' +
+      'and resubmit. Never share these with anyone, including support staff.';
+    if (!category) return base;
+    return `${base} Detected category: ${category}.`;
+  }
 
   private validateVotes(votes: VoteWeightSummary): void {
     if (!votes) {

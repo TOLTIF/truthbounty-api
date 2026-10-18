@@ -12,12 +12,15 @@ import { ProjectEvidenceVersion } from './entities/project-evidence-version.enti
 import { ProjectorCursor } from '../common/entities/projector-cursor.entity';
 import { CanonicalEvent } from '../events/entities/canonical-event.entity';
 import { CanonicalEventQueryService } from '../events/canonical-event-query.service';
+import { V2OutboxService } from '../outbox/v2-outbox.service';
+import { V2OutboxMessage } from '../outbox/entities/v2-outbox-message.entity';
 
 describe('EvidenceProjectorService (integration)', () => {
   let moduleRef: TestingModule;
   let projector: EvidenceProjectorService;
   let queryService: EvidenceQueryService;
   let integrityService: EvidenceIntegrityService;
+  let outboxService: V2OutboxService;
   let dataSource: DataSource;
 
   const claimId = '0x' + '11'.repeat(32);
@@ -51,6 +54,7 @@ describe('EvidenceProjectorService (integration)', () => {
             ProjectEvidence,
             ProjectEvidenceVersion,
             ProjectorCursor,
+            V2OutboxMessage,
           ],
           synchronize: true,
         }),
@@ -59,6 +63,7 @@ describe('EvidenceProjectorService (integration)', () => {
           ProjectEvidenceVersion,
           ProjectorCursor,
           CanonicalEvent,
+          V2OutboxMessage,
         ]),
       ],
       providers: [
@@ -66,12 +71,14 @@ describe('EvidenceProjectorService (integration)', () => {
         EvidenceQueryService,
         EvidenceIntegrityService,
         CanonicalEventQueryService,
+        V2OutboxService,
       ],
     }).compile();
 
     projector = moduleRef.get(EvidenceProjectorService);
     queryService = moduleRef.get(EvidenceQueryService);
     integrityService = moduleRef.get(EvidenceIntegrityService);
+    outboxService = moduleRef.get(V2OutboxService);
     dataSource = moduleRef.get(DataSource);
   });
 
@@ -95,6 +102,60 @@ describe('EvidenceProjectorService (integration)', () => {
     expect(evidence.currentVersion).toBe(1);
     expect(evidence.status).toBe(EvidenceStatus.ACTIVE);
     expect(evidence.contentDigest).toBe('0xdigest1');
+    const checkpoint = await dataSource
+      .getRepository(ProjectorCursor)
+      .findOneBy({ projectorName: 'v2-evidence' });
+    expect(checkpoint).toMatchObject({
+      lastBlockNumber: '100',
+      lastLogIndex: 0,
+    });
+    expect(await outboxService.getPendingCount()).toBe(1);
+  });
+
+  it('rolls projection, cursor, and outbox back together if publishing fails', async () => {
+    await seedEvent({
+      eventName: 'EvidenceRegistered',
+      txHash: '0x' + '09'.repeat(32),
+      blockNumber: '109',
+      logIndex: 2,
+      payload: { digest: 'atomic-digest' },
+    });
+
+    const publish = outboxService.publishWithManager.bind(outboxService);
+    const publishSpy = jest
+      .spyOn(outboxService, 'publishWithManager')
+      .mockImplementation(async (manager, params) => {
+        await publish(manager, params);
+        throw new Error('simulated failure after outbox insert');
+      });
+
+    await expect(projector.processNewEvents()).rejects.toThrow(
+      'simulated failure after outbox insert',
+    );
+    expect(
+      await dataSource
+        .getRepository(ProjectEvidence)
+        .findOneBy({ evidenceId: claimId }),
+    ).toBeNull();
+    expect(
+      await dataSource
+        .getRepository(ProjectEvidenceVersion)
+        .countBy({ evidenceId: claimId }),
+    ).toBe(0);
+    expect(
+      await dataSource
+        .getRepository(ProjectorCursor)
+        .findOneBy({ projectorName: 'v2-evidence' }),
+    ).toBeNull();
+    expect(await outboxService.getPendingCount()).toBe(0);
+
+    publishSpy.mockRestore();
+    await expect(projector.processNewEvents()).resolves.toEqual({
+      processed: 1,
+      applied: 1,
+      duplicates: 0,
+    });
+    expect(await outboxService.getPendingCount()).toBe(1);
   });
 
   it('EvidenceReplaced appends a new version and bumps currentVersion without deleting history', async () => {

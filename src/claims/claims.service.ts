@@ -19,6 +19,11 @@ import {
 import { AuditLog } from '../audit/decorators/audit-log.decorator';
 import { assertResolvedAtInvariant } from './claim-resolution.invariant';
 import { CacheUnavailableException } from '../cache/exceptions/cache-unavailable.exception';
+import {
+  SecretScannerService,
+  SecretScanResult,
+} from './secret-scanner.service';
+import { SecretQuarantineException } from './exceptions/secret-quarantine.exception';
 
 @Injectable()
 export class ClaimsService {
@@ -32,6 +37,7 @@ export class ClaimsService {
     private readonly claimsCache: ClaimsCache,
     private readonly redisService: RedisService,
     private readonly auditTrailService: AuditTrailService,
+    private readonly secretScannerService: SecretScannerService,
   ) {}
 
   /**
@@ -45,7 +51,7 @@ export class ClaimsService {
     } catch (error) {
       if (error instanceof CacheUnavailableException) {
         this.logger.warn(
-          `Cache unavailable for claim ${id}, serving from database: ${error.message}`,
+          ` Cache unavailable for claim ${id}, serving from database: ${error.message}`,
         );
         // Fall through to database fetch - cache failure is isolated from canonical state
       } else {
@@ -129,7 +135,7 @@ export class ClaimsService {
       }
     }
 
-    // Get claim IDs from user stakes
+    // Get claim IFs from user stakes
     const stakes = await this.stakeRepo.find({
       where: { walletAddress: wallet },
     });
@@ -139,7 +145,7 @@ export class ClaimsService {
 
     const claims = await this.claimRepo
       .createQueryBuilder('claim')
-      .where('claim.id IN (:...ids)', { ids: claimIds })
+      .where('claim.id IN (:ids)', { ids: claimIds })
       .orderBy('claim.createdAt', 'DESC')
       .getMany();
 
@@ -177,6 +183,36 @@ export class ClaimsService {
       throw new BadRequestException(
         'Claim content exceeds maximum length of 5000 characters',
       );
+    }
+
+    // Scan support submission for secrets before any persistence or forwarding.
+    // High-confidence secrets are quarantined and never echoed into logs or errors.
+    const scanResult: SecretScanResult = this.secretScannerService.scanSupportSubmission({
+      title: createClaimDto.title,
+      content: createClaimDto.content,
+      metadata: (createClaimDto as any).metadata,
+      attachments: (createClaimDto as any).attachments,
+    });
+
+    if (scanResult.blocked) {
+      // Quarantine access is restricted and audited. Only metadata about the
+      // findings (kind/count) -- never the secret material itself -- is recorded.
+      await this.auditTrailService.log({
+        actionType: AuditActionType.CLAIM_SECRET_QUARANTINED,
+        entityType: AuditEntityType.CLAIM,
+        entityId: scanResult.quarantineId,
+        description: `Support submission quarantined: ${scanResult.findings.length} finding(s), highest confidence ${scanResult.highestConfidence}`,
+        afterState: {
+          quarantineId: scanResult.quarantineId,
+          findingKinds: scanResult.findings.map((f) => f.kind),
+        },
+      });
+
+      this.logger.warn(
+        `Support submission quarantined ${scanResult.quarantineId} with ${scanResult.findings.length} finding(s); secret material withheld.`,
+      );
+
+      throw new SecretQuarantineException(scanResult.quarantineId);
     }
 
     // Check if a claim with the same content already exists
@@ -277,7 +313,7 @@ export class ClaimsService {
     }
 
     // Log the resolution
-    await this.auditTrailService.log({
+    await this.auditTrailService.log( {
       actionType: AuditActionType.CLAIM_RESOLVED,
       entityType: AuditEntityType.CLAIM,
       entityId: claimId,
@@ -320,7 +356,7 @@ export class ClaimsService {
     }
 
     // Log the finalization
-    await this.auditTrailService.log({
+    await this.auditTrailService.log( {
       actionType: AuditActionType.CLAIM_FINALIZED,
       entityType: AuditEntityType.CLAIM,
       entityId: claimId,

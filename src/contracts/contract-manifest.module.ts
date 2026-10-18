@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { ContractManifestValidatorService } from './contract-manifest-validator.service';
+import { AbiValidationService } from './abi-validation.service';
 
 /**
  * ContractManifestModule
@@ -16,7 +17,7 @@ import { ContractManifestValidatorService } from './contract-manifest-validator.
  */
 @Module({
   imports: [ConfigModule],
-  providers: [ContractManifestValidatorService],
-  exports: [ContractManifestValidatorService],
+  providers: [AbiValidationService, ContractManifestValidatorService],
+  exports: [ContractManifestValidatorService, AbiValidationService],
 })
 export class ContractManifestModule {}

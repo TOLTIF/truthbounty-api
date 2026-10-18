@@ -44,6 +44,7 @@ export const KNOWN_PROJECTORS = [
   'v2-evidence',
   'v2-verification',
   'v2-disputes',
+  'v2-rewards',
 ] as const;
 
 export type KnownProjector = (typeof KNOWN_PROJECTORS)[number];

@@ -1,0 +1,18 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "main",
+    "origin",
+    "security/issue-620-prewave-be-024-repair-notification-typeorm"
+  ],
+  "parent": {
+    "main": null,
+    "origin": "main",
+    "security/issue-620-prewave-be-024-repair-notification-typeorm": "main"
+  },
+  "order": [
+    "main",
+    "origin",
+    "security/issue-620-prewave-be-024-repair-notification-typeorm"
+  ]
+}
